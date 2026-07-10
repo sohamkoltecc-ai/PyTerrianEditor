@@ -243,6 +243,268 @@ class Terrain:
 
 
 # ---------------------------------------------------------------------------
+# Terrain texture painting (Unity-style splat mapping)
+# ---------------------------------------------------------------------------
+#
+# Each vertex carries a 4-component weight (grass/dirt/rock/sand). The
+# fragment shader normalizes these and blends the four tiled textures
+# accordingly, exactly like Unity's terrain "Paint Texture" tool. Painting
+# nudges the weights at the brushed vertices toward the selected layer
+# (with the others shrinking proportionally) using the same cosine falloff
+# as the sculpt brush, so strokes feel consistent across tools.
+
+class TerrainTextures:
+    LAYER_NAMES = ["Grass", "Dirt", "Rock", "Sand"]
+
+    def __init__(self, terrain, tile_scale=6.0):
+        self.tile_scale = tile_scale
+        self.weights = np.zeros((len(terrain.vertices), 4), dtype="float32")
+        self.initialize_from_height_slope(terrain)
+
+    def initialize_from_height_slope(self, terrain):
+        """Seed sensible starting weights so the terrain looks reasonable
+        before any manual painting: grass on mid-height gentle slopes,
+        rock on steep slopes, sand in low areas, dirt filling the rest."""
+        y = terrain.vertices[:, 1]
+        up = np.clip(terrain.normals[:, 1], 0.0, 1.0)
+        y_min, y_max = float(y.min()), float(y.max())
+        span = max(y_max - y_min, 1e-6)
+        t = np.clip((y - y_min) / span, 0.0, 1.0)
+
+        grass = np.clip(1.0 - np.abs(t - 0.45) * 2.2, 0.0, 1.0) * up
+        sand = np.clip((0.25 - t) * 4.0, 0.0, 1.0)
+        rock = np.clip((1.0 - up) * 2.0, 0.0, 1.0)
+        dirt = np.clip(1.0 - grass - sand - rock, 0.05, 1.0)
+
+        w = np.stack([grass, dirt, rock, sand], axis=1)
+        wsum = w.sum(axis=1, keepdims=True)
+        wsum[wsum < 1e-6] = 1.0
+        self.weights = (w / wsum).astype("float32")
+
+    def paint(self, terrain, hit_point, radius, strength, layer_idx):
+        hx, hz = hit_point[0], hit_point[2]
+        vx = terrain.vertices[:, 0]
+        vz = terrain.vertices[:, 2]
+        dist = np.sqrt((vx - hx) ** 2 + (vz - hz) ** 2)
+        mask = dist <= radius
+        if not np.any(mask):
+            return
+
+        falloff = 0.5 * (1.0 + np.cos(np.pi * (dist[mask] / radius)))
+        amount = np.clip(strength * falloff, 0.0, 1.0)[:, None]
+
+        target = np.zeros(4, dtype="float32")
+        target[layer_idx] = 1.0
+
+        w = self.weights[mask]
+        self.weights[mask] = w + (target[None, :] - w) * amount
+
+
+# ---------------------------------------------------------------------------
+# Procedural textures (no external image assets required)
+# ---------------------------------------------------------------------------
+
+def _value_noise(size, cell, rng):
+    """Smooth value noise: a coarse random grid, bilinearly upsampled."""
+    grid_n = max(size // cell, 2)
+    grid = rng.random((grid_n + 1, grid_n + 1)).astype("float32")
+    ys = np.linspace(0, grid_n - 1e-6, size)
+    xs = np.linspace(0, grid_n - 1e-6, size)
+    gy, gx = np.meshgrid(ys, xs, indexing="ij")
+    y0 = gy.astype(int)
+    x0 = gx.astype(int)
+    y1 = np.clip(y0 + 1, 0, grid_n)
+    x1 = np.clip(x0 + 1, 0, grid_n)
+    ty = (gy - y0)[..., None]
+    tx = (gx - x0)[..., None]
+    v00 = grid[y0, x0][..., None]
+    v10 = grid[y0, x1][..., None]
+    v01 = grid[y1, x0][..., None]
+    v11 = grid[y1, x1][..., None]
+    v0 = v00 * (1 - tx) + v10 * tx
+    v1 = v01 * (1 - tx) + v11 * tx
+    return (v0 * (1 - ty) + v1 * ty)[..., 0]
+
+
+def generate_texture(base_color, size=256, seed=0, streaks=False, speckle=False):
+    """Builds a tileable-ish procedural albedo texture by layering value
+    noise at a few octaves on top of a base color."""
+    rng = np.random.default_rng(seed)
+    n1 = _value_noise(size, 6, rng)
+    n2 = _value_noise(size, 20, rng)
+    n3 = _value_noise(size, 56, rng)
+    noise = n1 * 0.5 + n2 * 0.3 + n3 * 0.2
+    noise = (noise - noise.min()) / max(noise.max() - noise.min(), 1e-6)
+
+    base = np.array(base_color, dtype="float32")
+    variation = (noise[..., None] - 0.5) * 0.35
+    img = np.clip(base[None, None, :] + variation, 0.0, 1.0)
+
+    if streaks:
+        xs = np.linspace(0, 30.0, size)
+        stripe = (np.sin(xs) * 0.04)[None, :, None]
+        img = np.clip(img + stripe, 0.0, 1.0)
+
+    if speckle:
+        speck = (rng.random((size, size)) > 0.985)[..., None]
+        img = np.where(speck, np.clip(img + 0.25, 0.0, 1.0), img)
+
+    return (img * 255).astype("uint8")
+
+
+def create_gl_texture(image_rgb_uint8):
+    tex = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    h, w, _ = image_rgb_uint8.shape
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE,
+                 np.ascontiguousarray(image_rgb_uint8))
+    glGenerateMipmap(GL_TEXTURE_2D)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glBindTexture(GL_TEXTURE_2D, 0)
+    return tex
+
+
+def build_terrain_textures():
+    """Must be called after the OpenGL context exists."""
+    return {
+        "grass": create_gl_texture(generate_texture((0.20, 0.42, 0.16), seed=1)),
+        "dirt": create_gl_texture(generate_texture((0.36, 0.24, 0.14), seed=2, speckle=True)),
+        "rock": create_gl_texture(generate_texture((0.42, 0.41, 0.40), seed=3, streaks=True)),
+        "sand": create_gl_texture(generate_texture((0.76, 0.69, 0.49), seed=4)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Terrain shader (4-layer splat blend + per-pixel lighting + distance fog)
+# ---------------------------------------------------------------------------
+
+TERRAIN_VERT_SRC = """
+#version 120
+attribute vec4 aWeights;
+varying vec3 vNormal;
+varying vec3 vWorldPos;
+varying vec4 vWeights;
+
+void main() {
+    vWorldPos = gl_Vertex.xyz;   // terrain has no model transform: object space == world space
+    vNormal = gl_Normal;
+    vWeights = aWeights;
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+}
+"""
+
+TERRAIN_FRAG_SRC = """
+#version 120
+uniform sampler2D texGrass;
+uniform sampler2D texDirt;
+uniform sampler2D texRock;
+uniform sampler2D texSand;
+uniform float texScale;
+uniform vec3 lightDir;
+uniform vec3 camPos;
+uniform vec3 fogColor;
+uniform float fogDensity;
+
+varying vec3 vNormal;
+varying vec3 vWorldPos;
+varying vec4 vWeights;
+
+void main() {
+    vec2 uv = vWorldPos.xz / texScale;
+    vec3 grass = texture2D(texGrass, uv).rgb;
+    vec3 dirt  = texture2D(texDirt,  uv).rgb;
+    vec3 rock  = texture2D(texRock,  uv).rgb;
+    vec3 sand  = texture2D(texSand,  uv).rgb;
+
+    vec4 w = max(vWeights, 0.0);
+    float wsum = w.x + w.y + w.z + w.w;
+    w = wsum > 0.0001 ? w / wsum : vec4(0.25, 0.25, 0.25, 0.25);
+
+    vec3 albedo = grass * w.x + dirt * w.y + rock * w.z + sand * w.w;
+
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(lightDir);
+    float diff = max(dot(N, L), 0.0);
+
+    // cheap ambient-occlusion proxy: steeper slopes read a touch darker
+    float ao = clamp(0.55 + 0.45 * N.y, 0.0, 1.0);
+
+    // subtle sheen on rock/sand fraction to sell a "wet/mineral" look
+    float sheen = (w.z + w.w * 0.5) * pow(diff, 2.0) * 0.15;
+
+    vec3 color = albedo * (0.32 * ao + 0.85 * diff) + sheen;
+
+    float dist = length(vWorldPos - camPos);
+    float fog = clamp(exp(-fogDensity * fogDensity * dist * dist), 0.0, 1.0);
+    color = mix(fogColor, color, fog);
+
+    gl_FragColor = vec4(color, 1.0);
+}
+"""
+
+
+def compile_shader(src, shader_type):
+    shader = glCreateShader(shader_type)
+    glShaderSource(shader, src)
+    glCompileShader(shader)
+    if not glGetShaderiv(shader, GL_COMPILE_STATUS):
+        raise RuntimeError(glGetShaderInfoLog(shader).decode())
+    return shader
+
+
+def build_shader_program(vert_src, frag_src):
+    vs = compile_shader(vert_src, GL_VERTEX_SHADER)
+    fs = compile_shader(frag_src, GL_FRAGMENT_SHADER)
+    program = glCreateProgram()
+    glAttachShader(program, vs)
+    glAttachShader(program, fs)
+    glLinkProgram(program)
+    if not glGetProgramiv(program, GL_LINK_STATUS):
+        raise RuntimeError(glGetProgramInfoLog(program).decode())
+    glDeleteShader(vs)
+    glDeleteShader(fs)
+    return program
+
+
+def draw_terrain_solid_textured(terrain, tex_ids, weights, program, uniforms,
+                                 cam_pos, tile_scale, light_dir, fog_color, fog_density):
+    glUseProgram(program)
+    glUniform1i(uniforms["texGrass"], 0)
+    glUniform1i(uniforms["texDirt"], 1)
+    glUniform1i(uniforms["texRock"], 2)
+    glUniform1i(uniforms["texSand"], 3)
+    glUniform1f(uniforms["texScale"], tile_scale)
+    glUniform3f(uniforms["lightDir"], *light_dir)
+    glUniform3f(uniforms["camPos"], *cam_pos)
+    glUniform3f(uniforms["fogColor"], *fog_color)
+    glUniform1f(uniforms["fogDensity"], fog_density)
+
+    for i, key in enumerate(("grass", "dirt", "rock", "sand")):
+        glActiveTexture(GL_TEXTURE0 + i)
+        glBindTexture(GL_TEXTURE_2D, tex_ids[key])
+
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_NORMAL_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, terrain.vertices)
+    glNormalPointer(GL_FLOAT, 0, terrain.normals)
+
+    loc = uniforms["aWeights"]
+    glEnableVertexAttribArray(loc)
+    glVertexAttribPointer(loc, 4, GL_FLOAT, GL_FALSE, 0, weights)
+
+    glDrawElements(GL_TRIANGLES, len(terrain.tris) * 3, GL_UNSIGNED_INT, terrain.tris)
+
+    glDisableVertexAttribArray(loc)
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glDisableClientState(GL_NORMAL_ARRAY)
+    glActiveTexture(GL_TEXTURE0)
+    glUseProgram(0)
+
+
+# ---------------------------------------------------------------------------
 # Foliage system
 # ---------------------------------------------------------------------------
 #
@@ -861,21 +1123,8 @@ def draw_foliage(foliage, display_lists):
 
 
 # ---------------------------------------------------------------------------
-# Rendering (client-side vertex arrays, no shaders needed)
+# Rendering (client-side vertex arrays, no shaders needed for wireframe)
 # ---------------------------------------------------------------------------
-
-def draw_terrain_solid(terrain):
-    glEnableClientState(GL_VERTEX_ARRAY)
-    glEnableClientState(GL_NORMAL_ARRAY)
-    glEnableClientState(GL_COLOR_ARRAY)
-    glVertexPointer(3, GL_FLOAT, 0, terrain.vertices)
-    glNormalPointer(GL_FLOAT, 0, terrain.normals)
-    glColorPointer(3, GL_FLOAT, 0, terrain.colors)
-    glDrawElements(GL_TRIANGLES, len(terrain.tris) * 3, GL_UNSIGNED_INT, terrain.tris)
-    glDisableClientState(GL_VERTEX_ARRAY)
-    glDisableClientState(GL_NORMAL_ARRAY)
-    glDisableClientState(GL_COLOR_ARRAY)
-
 
 def draw_terrain_wireframe(terrain):
     glEnableClientState(GL_VERTEX_ARRAY)
@@ -887,7 +1136,7 @@ def draw_terrain_wireframe(terrain):
 def draw_brush_ring(center, radius, color=(1.0, 1.0, 0.2), segments=48):
     """A flat ring on the XZ plane at the brush's hit point, for feedback.
     Color is used to distinguish tools/modes (sculpt vs foliage paint vs
-    foliage erase)."""
+    foliage erase vs texture paint)."""
     glDisable(GL_LIGHTING)
     glColor3f(*color)
     glLineWidth(2.0)
@@ -942,6 +1191,21 @@ def main():
     rng_paint = np.random.default_rng()
     show_foliage = True
 
+    # -- realistic terrain texturing (splat-mapped, Unity style) -----------
+    terrain_textures = TerrainTextures(terrain, tile_scale=6.0)
+    terrain_tex_ids = build_terrain_textures()
+    terrain_shader = build_shader_program(TERRAIN_VERT_SRC, TERRAIN_FRAG_SRC)
+    terrain_uniforms = {
+        name: glGetUniformLocation(terrain_shader, name)
+        for name in ("texGrass", "texDirt", "texRock", "texSand",
+                     "texScale", "lightDir", "camPos", "fogColor", "fogDensity")
+    }
+    terrain_uniforms["aWeights"] = glGetAttribLocation(terrain_shader, "aWeights")
+
+    light_dir = (0.35, 0.85, 0.35)
+    fog_color = (0.55, 0.62, 0.70)
+    fog_density = 0.012
+
     cam_pos = np.array([0.0, 15.0, -45.0], dtype="float32")
     cam_yaw = 90.0
     cam_pitch = -15.0
@@ -949,9 +1213,9 @@ def main():
     show_solid = True
     show_wireframe = False
 
-    # -- tool selection: sculpt terrain, or paint foliage ------------------
-    tool_idx = 0  # 0 = Sculpt Terrain, 1 = Paint Foliage
-    tool_labels = ["Sculpt Terrain", "Paint Foliage"]
+    # -- tool selection: sculpt terrain, paint foliage, or paint texture ---
+    tool_idx = 0  # 0 = Sculpt Terrain, 1 = Paint Foliage, 2 = Paint Texture
+    tool_labels = ["Sculpt Terrain", "Paint Foliage", "Paint Texture"]
 
     brush_mode = 0  # 0=raise 1=lower 2=flatten 3=smooth
     brush_modes = ["Raise", "Lower", "Flatten", "Smooth"]
@@ -963,6 +1227,10 @@ def main():
     foliage_erase_mode = False
     foliage_soft_edge = True  # denser near brush center, thinning toward the rim
     foliage_scatter_density = 1.0  # only used by the explicit "Scatter Fill" button
+
+    texture_layer_idx = 0  # index into TerrainTextures.LAYER_NAMES
+    texture_strength = 0.6
+    texture_tile_scale = terrain_textures.tile_scale
 
     looking = False        # right mouse button held
     flatten_height = None  # captured at the start of a flatten stroke
@@ -996,7 +1264,7 @@ def main():
                 if event.key == K_t:
                     show_foliage = not show_foliage
                 if event.key == K_TAB:
-                    tool_idx = 1 - tool_idx
+                    tool_idx = (tool_idx + 1) % len(tool_labels)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 looking = True
                 pygame.mouse.set_visible(False)
@@ -1028,7 +1296,7 @@ def main():
             clicked, brush_mode = imgui.combo("Brush", brush_mode, brush_modes)
             _, brush_radius = imgui.slider_float("Radius##sculpt", brush_radius, 1.0, 20.0)
             _, brush_strength = imgui.slider_float("Strength", brush_strength, 0.05, 5.0)
-        else:
+        elif tool_idx == 1:
             # -- foliage painting controls --
             imgui.text("Foliage Brush")
             _, foliage_type_idx = imgui.combo("Type", foliage_type_idx, FOLIAGE_TYPE_LABELS)
@@ -1038,6 +1306,17 @@ def main():
             _, foliage_erase_mode = imgui.checkbox("Erase mode", foliage_erase_mode)
             if imgui.button("Clear all foliage"):
                 foliage.clear()
+        else:
+            # -- terrain texture (splat) painting controls --
+            imgui.text("Texture Brush")
+            _, texture_layer_idx = imgui.combo("Layer", texture_layer_idx, TerrainTextures.LAYER_NAMES)
+            _, brush_radius = imgui.slider_float("Radius##texture", brush_radius, 0.5, 20.0)
+            _, texture_strength = imgui.slider_float("Strength##texture", texture_strength, 0.02, 1.0)
+            changed_scale, texture_tile_scale = imgui.slider_float("Tile scale", texture_tile_scale, 1.0, 20.0)
+            if changed_scale:
+                terrain_textures.tile_scale = texture_tile_scale
+            if imgui.button("Reset from height/slope"):
+                terrain_textures.initialize_from_height_slope(terrain)
 
         imgui.separator()
         _, show_solid = imgui.checkbox("Show solid faces (G)", show_solid)
@@ -1049,6 +1328,7 @@ def main():
         if imgui.button("Regenerate terrain"):
             terrain.regenerate(seed=int(np.random.randint(0, 1_000_000)))
             foliage.update_all(terrain)  # re-glue/cull existing foliage, add nothing new
+            terrain_textures.initialize_from_height_slope(terrain)  # fresh terrain -> fresh splat seed
         imgui.same_line()
         if imgui.button("Flatten to 0"):
             terrain.flatten_all(0.0)
@@ -1063,6 +1343,11 @@ def main():
             if imgui.button("Scatter Fill (random)"):
                 foliage.generate(terrain, density=foliage_scatter_density,
                                   seed=int(np.random.randint(0, 1_000_000)))
+            imgui.tree_pop()
+
+        if imgui.tree_node("Atmosphere"):
+            _, fog_density = imgui.slider_float("Fog density", fog_density, 0.0, 0.05)
+            changed_fog, fog_color = imgui.color_edit3("Fog / sky color", *fog_color)
             imgui.tree_pop()
 
         imgui.separator()
@@ -1139,7 +1424,7 @@ def main():
                     )
                     # keep foliage glued to (or removed from) the freshly edited area
                     foliage.update_region(terrain, brush_hit, brush_radius)
-                else:
+                elif tool_idx == 1:
                     # -- foliage painting --
                     if foliage_erase_mode:
                         foliage.erase_instances(brush_hit, brush_radius)
@@ -1151,9 +1436,15 @@ def main():
                             count += 1
                         foliage.add_instances(terrain, brush_hit, brush_radius, count, selected, rng_paint,
                                                soft_edge=foliage_soft_edge)
+                else:
+                    # -- terrain texture (splat) painting --
+                    terrain_textures.paint(
+                        terrain, brush_hit, brush_radius,
+                        texture_strength * (dt / 16.0), texture_layer_idx,
+                    )
 
         # ---- render scene ----
-        glClearColor(0.1, 0.1, 0.15, 1.0)
+        glClearColor(fog_color[0], fog_color[1], fog_color[2], 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         glMatrixMode(GL_MODELVIEW)
@@ -1165,21 +1456,25 @@ def main():
         )
 
         if show_solid:
-            glEnable(GL_LIGHTING)
-            draw_terrain_solid(terrain)
+            draw_terrain_solid_textured(
+                terrain, terrain_tex_ids, terrain_textures.weights,
+                terrain_shader, terrain_uniforms,
+                cam_pos, terrain_textures.tile_scale, light_dir, fog_color, fog_density,
+            )
         if show_wireframe:
             glDisable(GL_LIGHTING)
             glColor3f(0.0, 0.0, 0.0)
             draw_terrain_wireframe(terrain)
+            glEnable(GL_LIGHTING)
         if show_foliage:
             draw_foliage(foliage, foliage_display_lists)
         if brush_hit is not None:
             if tool_idx == 0:
                 ring_color = (1.0, 1.0, 0.2)       # yellow: sculpt
-            elif foliage_erase_mode:
-                ring_color = (1.0, 0.25, 0.25)     # red: foliage erase
+            elif tool_idx == 1:
+                ring_color = (1.0, 0.25, 0.25) if foliage_erase_mode else (0.25, 1.0, 0.35)
             else:
-                ring_color = (0.25, 1.0, 0.35)     # green: foliage paint
+                ring_color = (0.3, 0.6, 1.0)       # blue: texture paint
             draw_brush_ring(brush_hit, brush_radius, ring_color)
             glEnable(GL_LIGHTING)
 
