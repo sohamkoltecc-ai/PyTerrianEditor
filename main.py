@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import numpy as np
 import pygame
@@ -1123,6 +1124,233 @@ def draw_foliage(foliage, display_lists):
 
 
 # ---------------------------------------------------------------------------
+# Custom foliage import (Sketchfab downloads / your own Blender exports)
+# ---------------------------------------------------------------------------
+#
+# Anyone can drop a .obj model into the "Import custom foliage" panel and
+# it becomes a brand-new paintable foliage type alongside the built-in
+# tree/bush/grass/etc, with its own placement rules (height band, min
+# slope) and scale range set right there in the UI.
+#
+# Why .obj: it's the one format every relevant tool agrees on -
+# Sketchfab offers an "Original Format" / OBJ download for CC-licensed
+# models, and Blender exports it natively (File > Export > Wavefront
+# (.obj)). If a model only comes as .fbx/.gltf/.glb, open it in Blender
+# once and re-export as .obj - free, and it keeps this file dependency-free
+# (no fbx/gltf parser needed).
+
+def load_obj_mesh(path):
+    """Minimal Wavefront OBJ parser. Returns (verts, norms, faces) where
+    verts/norms are lists of (x, y, z) tuples and faces is a list of
+    faces, each a list of (vertex_index, normal_index_or_None). Polygons
+    with more than 3 vertices are left as-is here and fan-triangulated by
+    the caller. UVs and materials are intentionally ignored - imported
+    foliage renders as a flat tinted color, same as the built-in props."""
+    verts, norms, faces = [], [], []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            tag = parts[0]
+            if tag == "v" and len(parts) >= 4:
+                verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif tag == "vn" and len(parts) >= 4:
+                norms.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif tag == "f":
+                face = []
+                for token in parts[1:]:
+                    idxs = token.split("/")
+                    vi = int(idxs[0])
+                    vi = vi - 1 if vi > 0 else len(verts) + vi
+                    ni = None
+                    if len(idxs) >= 3 and idxs[2]:
+                        ni = int(idxs[2])
+                        ni = ni - 1 if ni > 0 else len(norms) + ni
+                    face.append((vi, ni))
+                if len(face) >= 3:
+                    faces.append(face)
+    if not verts:
+        raise ValueError("No vertices found - is this a valid .obj file?")
+    if not faces:
+        raise ValueError("No faces found - the .obj has points but no geometry")
+    return verts, norms, faces
+
+
+def build_display_list_from_obj(path, target_height=1.0, color=(0.35, 0.45, 0.22)):
+    """Loads an .obj, recenters it on X/Z, drops it onto Y=0, uniformly
+    rescales it to `target_height` tall, and compiles it into a GL display
+    list exactly like the built-in _build_*_list() functions - so it can
+    be dropped straight into the same foliage_display_lists dict and
+    drawn/instanced identically to trees/bushes/rocks/etc."""
+    verts, norms, faces = load_obj_mesh(path)
+    v_arr = np.array(verts, dtype="float64")
+
+    min_y, max_y = float(v_arr[:, 1].min()), float(v_arr[:, 1].max())
+    span = max(max_y - min_y, 1e-6)
+    scale = target_height / span
+    cx = (float(v_arr[:, 0].min()) + float(v_arr[:, 0].max())) / 2.0
+    cz = (float(v_arr[:, 2].min()) + float(v_arr[:, 2].max())) / 2.0
+
+    def xform(v):
+        return ((v[0] - cx) * scale, (v[1] - min_y) * scale, (v[2] - cz) * scale)
+
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glColor3f(*color)
+    glBegin(GL_TRIANGLES)
+    for face in faces:
+        # fan-triangulate n-gons
+        for i in range(1, len(face) - 1):
+            tri = (face[0], face[i], face[i + 1])
+            pts = [xform(verts[vi]) for vi, _ in tri]
+            if all(ni is not None for _, ni in tri):
+                for (vi, ni), p in zip(tri, pts):
+                    n = norms[ni]
+                    glNormal3f(n[0], n[1], n[2])
+                    glVertex3f(*p)
+            else:
+                # no vertex normals in the file - use the flat face normal
+                p0, p1, p2 = (np.array(p) for p in pts)
+                n = np.cross(p1 - p0, p2 - p0)
+                nl = np.linalg.norm(n)
+                n = (n / nl) if nl > 1e-8 else np.array([0.0, 1.0, 0.0])
+                for p in pts:
+                    glNormal3f(float(n[0]), float(n[1]), float(n[2]))
+                    glVertex3f(*p)
+    glEnd()
+    glEndList()
+    return list_id
+
+
+def register_custom_foliage(display_lists, name, model_path, min_h, max_h, min_up,
+                             scale_range, color=(0.35, 0.45, 0.22), target_height=1.0):
+    """Loads `model_path` as a new foliage type and appends it to the
+    global FOLIAGE_RULES / FOLIAGE_TYPE_LABELS so it shows up in the
+    "Type" dropdown of the foliage brush right alongside the built-ins.
+    Returns the new type's index (to select it automatically)."""
+    list_id = build_display_list_from_obj(model_path, target_height=target_height, color=color)
+    new_idx = len(FOLIAGE_RULES)
+    display_lists[new_idx] = list_id
+    FOLIAGE_RULES.append(dict(
+        name=name, min_h=min_h, max_h=max_h, min_up=min_up, weight=0.1, scale=scale_range,
+    ))
+    # mutate in place (slice assignment) so every existing reference to
+    # this list - e.g. the imgui.combo() call in main() - sees the update
+    FOLIAGE_TYPE_LABELS[:] = [r["name"].capitalize() for r in FOLIAGE_RULES] + ["All (mix)"]
+    return new_idx
+
+
+def browse_for_model_file():
+    """Tries to open a native "Open File" dialog via Tkinter. Returns
+    (True, path) if the dialog opened normally (path is "" if the person
+    cancelled it), or (False, "") if Tkinter isn't available/working on
+    this system - in which case the caller should fall back to the
+    built-in in-app browser (open_inapp_browser / draw_inapp_browser
+    below), which has no dependency on Tkinter at all."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Select a foliage model",
+            filetypes=[("Wavefront OBJ", "*.obj"), ("All files", "*.*")],
+        )
+        root.destroy()
+        return True, path
+    except Exception as e:
+        print("Native file dialog unavailable ({}); using the in-app browser instead.".format(e))
+        return False, ""
+
+
+# -- in-app (Tkinter-free) file browser, used automatically whenever the ---
+# -- native dialog above isn't available (e.g. Tkinter not installed) -----
+
+def list_dir_entries(directory, extension=".obj"):
+    """Returns (subdirs, matching_files), both sorted, for `directory`.
+    Returns ([], []) if the directory can't be read (bad path, permissions,
+    a drive that no longer exists, etc.) so the browser can show an
+    error instead of crashing."""
+    try:
+        entries = os.listdir(directory)
+    except Exception:
+        return [], []
+    subdirs = sorted(
+        e for e in entries
+        if not e.startswith(".") and os.path.isdir(os.path.join(directory, e))
+    )
+    files = sorted(e for e in entries if e.lower().endswith(extension))
+    return subdirs, files
+
+
+def default_browse_start_dir():
+    """Starts in ~/Downloads when it exists (where a Sketchfab .zip is
+    usually extracted to), otherwise the home directory."""
+    home = os.path.expanduser("~")
+    downloads = os.path.join(home, "Downloads")
+    return downloads if os.path.isdir(downloads) else home
+
+
+def draw_inapp_browser(browse_dir):
+    """Renders the fallback in-app file browser window. Sizes and centers
+    itself against the *current* window/display size every time it's
+    opened (imgui.APPEARING), so it always fits on screen instead of
+    being clipped when the app window is small. Returns
+    (still_open, new_browse_dir, picked_file_path_or_None)."""
+    picked = None
+    io = imgui.get_io()
+    disp_w, disp_h = io.display_size
+    # fit inside the current window with a margin, but don't go below a
+    # usable minimum - if the window is *very* small the browser will be
+    # tight, but it will never be pushed off-screen or unreadable
+    margin = 40
+    win_w = max(260, min(460, disp_w - margin))
+    win_h = max(220, min(420, disp_h - margin))
+    imgui.set_next_window_size(win_w, win_h, imgui.APPEARING)
+    imgui.set_next_window_position(
+        max(0, (disp_w - win_w) / 2.0), max(0, (disp_h - win_h) / 2.0), imgui.APPEARING
+    )
+    expanded, still_open = imgui.begin("Select Foliage Model (.obj)", True)
+    if expanded:
+        imgui.text_wrapped("Folder: " + browse_dir)
+        imgui.push_item_width(-70)
+        changed, new_path = imgui.input_text("##browser_path", browse_dir, 512)
+        imgui.pop_item_width()
+        if changed:
+            browse_dir = new_path
+        imgui.same_line()
+        if imgui.button("Go"):
+            if not os.path.isdir(browse_dir):
+                browse_dir = default_browse_start_dir()
+
+        if imgui.button(".. (up one level)"):
+            parent = os.path.dirname(browse_dir.rstrip(os.sep) or os.sep)
+            browse_dir = parent if parent else browse_dir
+
+        imgui.separator()
+        subdirs, files = list_dir_entries(browse_dir, ".obj")
+        # let the list fill whatever vertical space is left in the window
+        list_h = max(100, imgui.get_content_region_available()[1])
+        imgui.begin_child("browser_entries", 0, list_h, border=True)
+        if not subdirs and not files:
+            imgui.text_disabled("(no subfolders or .obj files here)")
+        for d in subdirs:
+            clicked, _ = imgui.selectable("[folder] " + d, False)
+            if clicked:
+                browse_dir = os.path.join(browse_dir, d)
+        for fname in files:
+            clicked, _ = imgui.selectable(fname, False)
+            if clicked:
+                picked = os.path.join(browse_dir, fname)
+        imgui.end_child()
+    imgui.end()
+    return still_open, browse_dir, picked
+
+
+# ---------------------------------------------------------------------------
 # Rendering (client-side vertex arrays, no shaders needed for wireframe)
 # ---------------------------------------------------------------------------
 
@@ -1228,6 +1456,18 @@ def main():
     foliage_soft_edge = True  # denser near brush center, thinning toward the rim
     foliage_scatter_density = 1.0  # only used by the explicit "Scatter Fill" button
 
+    # -- custom foliage import (Sketchfab downloads / your own Blender exports) --
+    import_path = ""
+    import_name = "My Foliage"
+    import_min_h = -1.0
+    import_max_h = 2.0
+    import_min_up = 0.5
+    import_scale_range = (0.6, 1.2)
+    import_color = (0.35, 0.45, 0.22)
+    import_status = ""
+    show_inapp_browser = False
+    browse_dir = default_browse_start_dir()
+
     texture_layer_idx = 0  # index into TerrainTextures.LAYER_NAMES
     texture_strength = 0.6
     texture_tile_scale = terrain_textures.tile_scale
@@ -1281,7 +1521,7 @@ def main():
 
         # ---- ImGui panel ----
         imgui.set_next_window_position(15, 15, imgui.ONCE)
-        imgui.set_next_window_size(320, 0, imgui.ONCE)
+        imgui.set_next_window_size(380, 0, imgui.ONCE)
         imgui.begin("Terrain Editor", True)
 
         imgui.text("Mode: {}".format("Look/Fly (RMB held)" if looking else "Edit (LMB paints)"))
@@ -1306,6 +1546,63 @@ def main():
             _, foliage_erase_mode = imgui.checkbox("Erase mode", foliage_erase_mode)
             if imgui.button("Clear all foliage"):
                 foliage.clear()
+
+            imgui.separator()
+            if imgui.tree_node("Import custom foliage (.obj)"):
+                imgui.text_wrapped(
+                    "Get a model from Sketchfab (pick the OBJ / Original "
+                    "Format download for CC-licensed models) or make your "
+                    "own in Blender and export via File > Export > "
+                    "Wavefront (.obj). Other formats (.fbx/.gltf/.glb)? "
+                    "Open them in Blender once and re-export as .obj."
+                )
+                imgui.text("File path:")
+                imgui.push_item_width(-1)
+                _, import_path = imgui.input_text("##foliage_import_path", import_path, 512)
+                imgui.pop_item_width()
+                if imgui.button("Browse..."):
+                    dialog_worked, picked = browse_for_model_file()
+                    if dialog_worked:
+                        if picked:
+                            import_path = picked
+                    else:
+                        show_inapp_browser = True
+                imgui.same_line()
+                if imgui.button("Browse (in-app)"):
+                    show_inapp_browser = True
+                _, import_name = imgui.input_text("Name", import_name, 64)
+                _, import_min_h = imgui.slider_float("Min height", import_min_h, -2.0, 2.0)
+                _, import_max_h = imgui.slider_float("Max height", import_max_h, -2.0, 2.0)
+                _, import_min_up = imgui.slider_float("Min flatness", import_min_up, 0.0, 1.0)
+                _, import_scale_range = imgui.slider_float2(
+                    "Scale range", import_scale_range[0], import_scale_range[1], 0.1, 3.0
+                )
+                _, import_color = imgui.color_edit3("Tint color", *import_color)
+                if imgui.button("Import as new foliage type"):
+                    if import_path and os.path.isfile(import_path):
+                        try:
+                            was_all = (foliage_type_idx >= len(FOLIAGE_RULES))
+                            new_idx = register_custom_foliage(
+                                foliage_display_lists,
+                                import_name or "Custom",
+                                import_path,
+                                min(import_min_h, import_max_h),
+                                max(import_min_h, import_max_h),
+                                import_min_up,
+                                (min(import_scale_range), max(import_scale_range)),
+                                color=import_color,
+                            )
+                            # keep "All (mix)" selected if it was selected before,
+                            # otherwise auto-select the freshly imported type
+                            foliage_type_idx = len(FOLIAGE_RULES) if was_all else new_idx
+                            import_status = "Imported '{}' as a new foliage type.".format(import_name)
+                        except Exception as e:
+                            import_status = "Import failed: {}".format(e)
+                    else:
+                        import_status = "That file path doesn't exist - check it or use Browse..."
+                if import_status:
+                    imgui.text_wrapped(import_status)
+                imgui.tree_pop()
         else:
             # -- terrain texture (splat) painting controls --
             imgui.text("Texture Brush")
@@ -1356,6 +1653,13 @@ def main():
             "Tab: switch tool | LMB: paint with the active tool | T: toggle foliage"
         )
         imgui.end()
+
+        if show_inapp_browser:
+            show_inapp_browser, browse_dir, picked_file = draw_inapp_browser(browse_dir)
+            if picked_file:
+                import_path = picked_file
+                import_status = "Selected: " + picked_file
+                show_inapp_browser = False
 
         # ---- camera look (only while RMB held) ----
         if looking:
@@ -1486,6 +1790,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
