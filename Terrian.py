@@ -1124,13 +1124,13 @@ def draw_foliage(foliage, display_lists):
 
 
 # ---------------------------------------------------------------------------
-# Custom foliage import (Sketchfab downloads / your own Blender exports)
+# Custom model import (Sketchfab downloads / your own Blender exports)
 # ---------------------------------------------------------------------------
 #
-# Anyone can drop a .obj model into the "Import custom foliage" panel and
-# it becomes a brand-new paintable foliage type alongside the built-in
-# tree/bush/grass/etc, with its own placement rules (height band, min
-# slope) and scale range set right there in the UI.
+# Anyone can drop a .obj model into the "Import custom foliage" or
+# "Import custom road prop" panels and it becomes a brand-new paintable
+# type alongside the built-ins, with its own placement rules set right
+# there in the UI.
 #
 # Why .obj: it's the one format every relevant tool agrees on -
 # Sketchfab offers an "Original Format" / OBJ download for CC-licensed
@@ -1145,7 +1145,7 @@ def load_obj_mesh(path):
     faces, each a list of (vertex_index, normal_index_or_None). Polygons
     with more than 3 vertices are left as-is here and fan-triangulated by
     the caller. UVs and materials are intentionally ignored - imported
-    foliage renders as a flat tinted color, same as the built-in props."""
+    props render as a flat tinted color, same as the built-in ones."""
     verts, norms, faces = [], [], []
     with open(path, "r", errors="ignore") as f:
         for line in f:
@@ -1178,12 +1178,20 @@ def load_obj_mesh(path):
     return verts, norms, faces
 
 
-def build_display_list_from_obj(path, target_height=1.0, color=(0.35, 0.45, 0.22)):
+def build_display_list_from_obj(path, target_height=1.0, color=(0.35, 0.45, 0.22), forward_axis="+X"):
     """Loads an .obj, recenters it on X/Z, drops it onto Y=0, uniformly
     rescales it to `target_height` tall, and compiles it into a GL display
     list exactly like the built-in _build_*_list() functions - so it can
-    be dropped straight into the same foliage_display_lists dict and
-    drawn/instanced identically to trees/bushes/rocks/etc."""
+    be dropped straight into the same foliage/road-prop display-list dict
+    and drawn/instanced identically to the built-ins.
+
+    `forward_axis` tells us which local axis the model was authored to
+    "face" (its front, e.g. the direction a fence panel runs, or a lamp's
+    "into the road" side). Road props are rotated at draw time so this
+    axis lines up with the road's tangent direction, which is what keeps
+    a fence's orientation glued to the curve as the road bends - if an
+    imported model looks rotated 90 degrees off from the road, this is
+    the knob to fix it rather than the placement math."""
     verts, norms, faces = load_obj_mesh(path)
     v_arr = np.array(verts, dtype="float64")
 
@@ -1193,8 +1201,24 @@ def build_display_list_from_obj(path, target_height=1.0, color=(0.35, 0.45, 0.22
     cx = (float(v_arr[:, 0].min()) + float(v_arr[:, 0].max())) / 2.0
     cz = (float(v_arr[:, 2].min()) + float(v_arr[:, 2].max())) / 2.0
 
+    # pre-rotate around Y so the model's chosen "forward" axis becomes +X,
+    # which is the axis every draw call aligns to the tangent/yaw.
+    axis_yaw = {"+X": 0.0, "+Z": -math.pi / 2.0, "-X": math.pi, "-Z": math.pi / 2.0}.get(forward_axis, 0.0)
+    cos_a, sin_a = math.cos(axis_yaw), math.sin(axis_yaw)
+
     def xform(v):
-        return ((v[0] - cx) * scale, (v[1] - min_y) * scale, (v[2] - cz) * scale)
+        x = (v[0] - cx) * scale
+        y = (v[1] - min_y) * scale
+        z = (v[2] - cz) * scale
+        rx = x * cos_a - z * sin_a
+        rz = x * sin_a + z * cos_a
+        return (rx, y, rz)
+
+    def xform_normal(n):
+        nx, ny, nz = n
+        rx = nx * cos_a - nz * sin_a
+        rz = nx * sin_a + nz * cos_a
+        return (rx, ny, rz)
 
     list_id = glGenLists(1)
     glNewList(list_id, GL_COMPILE)
@@ -1207,7 +1231,7 @@ def build_display_list_from_obj(path, target_height=1.0, color=(0.35, 0.45, 0.22
             pts = [xform(verts[vi]) for vi, _ in tri]
             if all(ni is not None for _, ni in tri):
                 for (vi, ni), p in zip(tri, pts):
-                    n = norms[ni]
+                    n = xform_normal(norms[ni])
                     glNormal3f(n[0], n[1], n[2])
                     glVertex3f(*p)
             else:
@@ -1242,6 +1266,38 @@ def register_custom_foliage(display_lists, name, model_path, min_h, max_h, min_u
     return new_idx
 
 
+def _unique_prop_key(base_name):
+    """Turns a user-typed name into a safe, unique dict key for
+    ROAD_PROP_TYPE_KEYS (e.g. "My Fence!" -> "my_fence", or "my_fence_2"
+    if that key is already taken)."""
+    base = "".join(c.lower() if c.isalnum() else "_" for c in base_name).strip("_") or "prop"
+    while "__" in base:
+        base = base.replace("__", "_")
+    key = base
+    i = 2
+    while key in ROAD_PROP_TYPE_KEYS:
+        key = "{}_{}".format(base, i)
+        i += 1
+    return key
+
+
+def register_custom_road_prop(display_lists, name, model_path, color=(0.4, 0.4, 0.42),
+                               target_height=1.0, forward_axis="+X"):
+    """Loads `model_path` as a new road-prop type (a custom fence, guard
+    rail, bollard, streetlamp, whatever) and appends it to the global
+    ROAD_PROP_TYPE_KEYS / ROAD_PROP_TYPE_LABELS so it shows up in every
+    road's prop-layer "Type" dropdown right alongside Fence/Lamp. Returns
+    the new type's key (used to select it in a prop layer)."""
+    key = _unique_prop_key(name)
+    list_id = build_display_list_from_obj(
+        model_path, target_height=target_height, color=color, forward_axis=forward_axis
+    )
+    display_lists[key] = list_id
+    ROAD_PROP_TYPE_KEYS.append(key)
+    ROAD_PROP_TYPE_LABELS.append(name)
+    return key
+
+
 def browse_for_model_file():
     """Tries to open a native "Open File" dialog via Tkinter. Returns
     (True, path) if the dialog opened normally (path is "" if the person
@@ -1256,7 +1312,7 @@ def browse_for_model_file():
         root.withdraw()
         root.attributes("-topmost", True)
         path = filedialog.askopenfilename(
-            title="Select a foliage model",
+            title="Select a model",
             filetypes=[("Wavefront OBJ", "*.obj"), ("All files", "*.*")],
         )
         root.destroy()
@@ -1268,6 +1324,9 @@ def browse_for_model_file():
 
 # -- in-app (Tkinter-free) file browser, used automatically whenever the ---
 # -- native dialog above isn't available (e.g. Tkinter not installed) -----
+# -- Shared between the foliage importer and the road-prop importer: the ---
+# -- caller passes/receives a `target` tag so the picked path is routed ---
+# -- back to the right panel. --------------------------------------------
 
 def list_dir_entries(directory, extension=".obj"):
     """Returns (subdirs, matching_files), both sorted, for `directory`.
@@ -1294,7 +1353,7 @@ def default_browse_start_dir():
     return downloads if os.path.isdir(downloads) else home
 
 
-def draw_inapp_browser(browse_dir):
+def draw_inapp_browser(browse_dir, title="Select Model (.obj)"):
     """Renders the fallback in-app file browser window. Sizes and centers
     itself against the *current* window/display size every time it's
     opened (imgui.APPEARING), so it always fits on screen instead of
@@ -1313,7 +1372,7 @@ def draw_inapp_browser(browse_dir):
     imgui.set_next_window_position(
         max(0, (disp_w - win_w) / 2.0), max(0, (disp_h - win_h) / 2.0), imgui.APPEARING
     )
-    expanded, still_open = imgui.begin("Select Foliage Model (.obj)", True)
+    expanded, still_open = imgui.begin(title, True)
     if expanded:
         imgui.text_wrapped("Folder: " + browse_dir)
         imgui.push_item_width(-70)
@@ -1356,18 +1415,29 @@ def draw_inapp_browser(browse_dir):
 #
 # A RoadSpline is a chain of editable control points (world-space x/y/z).
 # A smooth Catmull-Rom curve is evaluated through them to build:
-#   1. a textured ribbon mesh (the road surface itself)
+#   1. a textured ribbon mesh (the road surface itself) - which can be an
+#      open path or a closed loop ("Complete Track")
 #   2. a terrain deformation mask that flattens the ground under the road
 #      and blends it smoothly into the surrounding terrain over a
 #      separately-adjustable margin ("affect width")
-#   3. a set of modular prop instances (fences, lamp posts, ...) scattered
-#      along the road edges at a configurable spacing/offset, exactly like
-#      the foliage brush but constrained to run parallel to the spline.
+#   3. any number of independent modular-prop *layers* (e.g. one layer of
+#      fences plus a second layer of lamp posts) scattered along the road
+#      edges at each layer's own spacing/offset, exactly like the foliage
+#      brush but constrained to run parallel to the spline. Every prop
+#      instance's yaw is derived from the spline's tangent at that point,
+#      so it always faces along the curve's actual direction - including
+#      through turns - rather than using one fixed rotation for the whole
+#      road.
+#
+# Roads can also branch off one another: picking a control point on an
+# existing road and using "Branch New Road Here" starts a brand new
+# RoadSpline at that same position, so you can build forks/junctions
+# without having to line up coordinates by hand.
 #
 # Everything derived (mesh/props/terrain target heights) is cached and
 # only recomputed when the spline is marked dirty (a point moved/added/
-# removed, or a shape parameter changed), so editing stays responsive even
-# with a fairly dense terrain grid.
+# removed, a shape parameter changed, or the loop toggled), so editing
+# stays responsive even with a fairly dense terrain grid.
 
 def catmull_rom_point(p0, p1, p2, p3, t):
     """Standard centripetal-ish (uniform) Catmull-Rom interpolation between
@@ -1384,7 +1454,7 @@ def catmull_rom_point(p0, p1, p2, p3, t):
 
 class RoadSpline:
     """A single editable road: control points -> smooth curve -> mesh +
-    terrain carve + modular props. Multiple independent RoadSpline
+    terrain carve + modular prop layers. Multiple independent RoadSpline
     instances can coexist (see the "Road Editor" tool in main())."""
 
     STEPS_PER_SEGMENT = 12  # curve smoothness between consecutive control points
@@ -1399,19 +1469,23 @@ class RoadSpline:
         self.height_offset = 0.05   # mesh sits slightly above the carved terrain (avoids z-fighting)
         self.uv_tile_length = 4.0   # world units per texture repeat along the road
 
-        # -- modular props (fence, lamp, ...) --
-        self.props_enabled = False
-        self.prop_type = "fence"
-        self.prop_spacing = 3.0
-        self.prop_side = "both"     # "left" | "right" | "both"
-        self.prop_offset = 0.3      # extra gap beyond half_width before placing props
+        # -- "Complete Track": when True the spline loops back from the
+        # last point to the first, closing the mesh/terrain-carve/props
+        # into a continuous circuit instead of an open-ended path --
+        self.closed = False
+
+        # -- modular props: an ordered list of independent layers, e.g.
+        # [{"type": "fence", ...}, {"type": "lamp", ...}] so a single road
+        # can carry a fence line AND a row of lamp posts together instead
+        # of needing a second road just to add a second prop type --
+        self.prop_layers = []
 
         self.selected_point = -1
 
         self._dirty = True
         self._samples = []
         self._mesh = None            # (verts, normals, uvs, tris) or None
-        self._prop_instances = []    # list of (pos, yaw_radians, side)
+        self._prop_instances = []    # list of (pos, yaw_radians, side, prop_type_key)
 
     # -- editing ----------------------------------------------------------
 
@@ -1437,6 +1511,38 @@ class RoadSpline:
         self._dirty = True
 
     def mark_dirty(self):
+        self._dirty = True
+
+    def set_closed(self, closed):
+        """Toggle "Complete Track": stitches the last control point back
+        to the first so the road forms a closed loop (a full circuit)
+        instead of stopping at its two ends."""
+        self.closed = bool(closed)
+        self._dirty = True
+
+    # -- modular prop layers ------------------------------------------------
+
+    def add_prop_layer(self, prop_type=None):
+        """Adds a new independent prop layer (e.g. a fence line or a row
+        of lamp posts) to this road. Multiple layers stack, so one road
+        can carry a fence AND lamps AND a custom-imported prop all at
+        once instead of needing a separate road per prop type."""
+        if prop_type is None:
+            prop_type = ROAD_PROP_TYPE_KEYS[0] if ROAD_PROP_TYPE_KEYS else "fence"
+        self.prop_layers.append({
+            "type": prop_type,
+            "enabled": True,
+            "spacing": 3.0,
+            "side": "both",        # "left" | "right" | "both"
+            "offset": 0.3,         # extra gap beyond half_width before placing this layer's props
+            "yaw_offset": 0.0,     # degrees, on top of the tangent-derived rotation (fixes mis-authored models)
+        })
+        self._dirty = True
+        return len(self.prop_layers) - 1
+
+    def remove_prop_layer(self, idx):
+        if 0 <= idx < len(self.prop_layers):
+            del self.prop_layers[idx]
         self._dirty = True
 
     def pick_point(self, ray_origin, ray_dir, pick_radius=0.6, max_dist=200.0):
@@ -1493,22 +1599,36 @@ class RoadSpline:
         self._prop_instances = self._compute_prop_instances(self._samples)
         self._dirty = False
 
+    def _is_closed(self):
+        return self.closed and len(self.points) >= 3
+
     def _compute_samples(self):
         pts = self.points
         n = len(pts)
         if n < 2:
             return []
+        closed = self._is_closed()
+        seg_count = n if closed else n - 1
         samples = []
         cum = 0.0
         prev_pos = None
-        for seg in range(n - 1):
-            p0 = pts[seg - 1] if seg - 1 >= 0 else pts[seg]
-            p1 = pts[seg]
-            p2 = pts[seg + 1]
-            p3 = pts[seg + 2] if seg + 2 < n else pts[seg + 1]
+        for seg in range(seg_count):
+            if closed:
+                p0 = pts[(seg - 1) % n]
+                p1 = pts[seg % n]
+                p2 = pts[(seg + 1) % n]
+                p3 = pts[(seg + 2) % n]
+            else:
+                p0 = pts[seg - 1] if seg - 1 >= 0 else pts[seg]
+                p1 = pts[seg]
+                p2 = pts[seg + 1]
+                p3 = pts[seg + 2] if seg + 2 < n else pts[seg + 1]
             steps = self.STEPS_PER_SEGMENT
-            last_segment = (seg == n - 2)
-            count = steps + 1 if last_segment else steps
+            last_segment = (seg == seg_count - 1)
+            # on an open path, include the final endpoint once; on a closed
+            # loop the final segment's endpoint is identical to sample[0],
+            # so it's skipped to avoid a duplicate/degenerate closing tri
+            count = steps + 1 if (not closed and last_segment) else steps
             for i in range(count):
                 t = i / steps
                 pos = catmull_rom_point(p0, p1, p2, p3, t)
@@ -1519,7 +1639,11 @@ class RoadSpline:
 
         m = len(samples)
         for i in range(m):
-            if i == 0:
+            if closed:
+                prev_i = (i - 1) % m
+                next_i = (i + 1) % m
+                tangent = samples[next_i]["pos"] - samples[prev_i]["pos"]
+            elif i == 0:
                 tangent = samples[1]["pos"] - samples[0]["pos"]
             elif i == m - 1:
                 tangent = samples[i]["pos"] - samples[i - 1]["pos"]
@@ -1538,6 +1662,7 @@ class RoadSpline:
         n = len(samples)
         if n < 2:
             return None
+        closed = self._is_closed()
         verts = np.zeros((n * 2, 3), dtype="float32")
         normals = np.zeros((n * 2, 3), dtype="float32")
         uvs = np.zeros((n * 2, 2), dtype="float32")
@@ -1554,27 +1679,44 @@ class RoadSpline:
             uvs[i * 2] = (0.0, v)
             uvs[i * 2 + 1] = (1.0, v)
         tris = []
-        for i in range(n - 1):
-            i0, i1, i2, i3 = i * 2, i * 2 + 1, (i + 1) * 2, (i + 1) * 2 + 1
+        # for a closed loop, stitch one extra edge connecting the last
+        # ring of verts back to the first, completing the circuit
+        edge_count = n if closed else n - 1
+        for i in range(edge_count):
+            i0, i1 = i * 2, i * 2 + 1
+            ni = (i + 1) % n
+            i2, i3 = ni * 2, ni * 2 + 1
             tris.append((i0, i2, i1))
             tris.append((i1, i2, i3))
         return verts, normals, uvs, np.array(tris, dtype="uint32")
 
     def _compute_prop_instances(self, samples):
-        if not self.props_enabled or len(samples) < 2:
+        if len(samples) < 2 or not self.prop_layers:
             return []
         instances = []
-        last_dist = -1e9
-        for s in samples:
-            if s["dist"] - last_dist < self.prop_spacing:
+        for layer in self.prop_layers:
+            if not layer.get("enabled", True):
                 continue
-            last_dist = s["dist"]
-            yaw = math.atan2(s["tangent"][2], s["tangent"][0])
-            off = self.half_width + self.prop_offset
-            if self.prop_side in ("left", "both"):
-                instances.append((s["pos"] - s["right"] * off, yaw, "left"))
-            if self.prop_side in ("right", "both"):
-                instances.append((s["pos"] + s["right"] * off, yaw, "right"))
+            spacing = max(float(layer.get("spacing", 3.0)), 0.1)
+            side = layer.get("side", "both")
+            offset = float(layer.get("offset", 0.3))
+            yaw_offset = math.radians(float(layer.get("yaw_offset", 0.0)))
+            prop_type = layer.get("type", "fence")
+            off = self.half_width + offset
+            last_dist = -1e9
+            for s in samples:
+                if s["dist"] - last_dist < spacing:
+                    continue
+                last_dist = s["dist"]
+                # yaw is derived fresh from THIS sample's tangent, so every
+                # instance's rotation tracks the curve's local direction -
+                # a fence on a bend rotates smoothly along with it instead
+                # of holding one fixed orientation for the whole road
+                yaw = math.atan2(s["tangent"][2], s["tangent"][0]) + yaw_offset
+                if side in ("left", "both"):
+                    instances.append((s["pos"] - s["right"] * off, yaw, "left", prop_type))
+                if side in ("right", "both"):
+                    instances.append((s["pos"] + s["right"] * off, yaw, "right", prop_type))
         return instances
 
     # -- terrain deformation ------------------------------------------------
@@ -1587,6 +1729,10 @@ class RoadSpline:
         if len(samples) < 2:
             return
         positions = np.array([s["pos"] for s in samples], dtype="float64")
+        if self._is_closed() and len(positions) >= 2:
+            # add the wrap-around segment back to the start point so the
+            # carve doesn't leave a gap at the loop's seam
+            positions = np.vstack([positions, positions[0:1]])
         A = positions[:-1]
         B = positions[1:]
         seg_len2 = (B[:, 0] - A[:, 0]) ** 2 + (B[:, 2] - A[:, 2]) ** 2
@@ -1629,7 +1775,8 @@ class RoadSpline:
         terrain.recompute_derived()
 
 
-# -- modular road props (fence, lamp post - easy to extend) ---------------
+# -- modular road props (fence, lamp - easy to extend, plus anything the --
+# -- user imports via "Import custom road prop") ---------------------------
 
 ROAD_PROP_TYPE_KEYS = ["fence", "lamp"]
 ROAD_PROP_TYPE_LABELS = ["Fence", "Lamp"]
@@ -1656,7 +1803,9 @@ def _build_fence_prop_list():
         glVertex3f(x0, post_h, z0)
         glVertex3f(x1, post_h, z1)
     glEnd()
-    # two horizontal rail stubs so repeated posts read as a fence line
+    # two horizontal rail stubs (running along local +X, i.e. this prop's
+    # "forward" axis) so repeated posts read as a fence line that runs
+    # parallel to the road rather than sticking out perpendicular to it
     rail_len, rail_thick = 0.9, 0.04
     glColor3f(0.46, 0.34, 0.18)
     for rail_y in (0.30, 0.55):
@@ -1721,12 +1870,22 @@ def build_road_texture():
 
 
 def draw_road_props(road, display_lists):
+    """Draws every prop instance for `road` (across all its enabled prop
+    layers). Each instance carries its own world position and a yaw
+    computed fresh from the spline's tangent at that point (see
+    RoadSpline._compute_prop_instances), so as the road curves, each post
+    along it is rotated to match the curve's local direction right there
+    - the whole fence/lamp line visibly follows the bend instead of every
+    instance sharing one rotation."""
     glEnable(GL_LIGHTING)
-    for pos, yaw, _side in road.get_prop_instances():
+    for pos, yaw, _side, prop_type in road.get_prop_instances():
+        list_id = display_lists.get(prop_type)
+        if list_id is None:
+            continue
         glPushMatrix()
         glTranslatef(float(pos[0]), float(pos[1]), float(pos[2]))
         glRotatef(math.degrees(yaw), 0.0, 1.0, 0.0)
-        glCallList(display_lists[road.prop_type])
+        glCallList(list_id)
         glPopMatrix()
 
 
@@ -1767,6 +1926,9 @@ def draw_road_centerline(road, color=(0.92, 0.85, 0.20)):
     for s in samples:
         p = s["pos"]
         glVertex3f(float(p[0]), float(p[1]) + road.height_offset + 0.02, float(p[2]))
+    if road._is_closed() and samples:
+        p0 = samples[0]["pos"]
+        glVertex3f(float(p0[0]), float(p0[1]) + road.height_offset + 0.02, float(p0[2]))
     glEnd()
     glLineWidth(1.0)
     glEnable(GL_LIGHTING)
@@ -1845,8 +2007,9 @@ def main():
     glEnable(GL_COLOR_MATERIAL)
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
     glShadeModel(GL_SMOOTH)
-    # foliage instances are drawn with non-uniform world scale via glScalef;
-    # GL_NORMALIZE keeps their lighting normals correct regardless of scale.
+    # foliage/road-prop instances are drawn with non-uniform world scale
+    # via glScalef; GL_NORMALIZE keeps their lighting normals correct
+    # regardless of scale.
     glEnable(GL_NORMALIZE)
 
     glEnable(GL_POLYGON_OFFSET_FILL)
@@ -1917,8 +2080,21 @@ def main():
     import_scale_range = (0.6, 1.2)
     import_color = (0.35, 0.45, 0.22)
     import_status = ""
+
+    # -- custom road-prop import (fence/lamp/etc - same .obj pipeline) --
+    road_import_path = ""
+    road_import_name = "My Prop"
+    road_import_height = 1.0
+    road_import_forward = "+X"
+    road_import_forward_options = ["+X", "+Z", "-X", "-Z"]
+    road_import_color = (0.5, 0.5, 0.52)
+    road_import_status = ""
+
+    # -- shared in-app file browser (Tkinter-free fallback); `browser_target`
+    # says which panel ("foliage" or "road_prop") the picked path goes to --
     show_inapp_browser = False
     browse_dir = default_browse_start_dir()
+    browser_target = None
 
     texture_layer_idx = 0  # index into TerrainTextures.LAYER_NAMES
     texture_strength = 0.6
@@ -1981,7 +2157,7 @@ def main():
 
         # ---- ImGui panel ----
         imgui.set_next_window_position(15, 15, imgui.ONCE)
-        imgui.set_next_window_size(380, 0, imgui.ONCE)
+        imgui.set_next_window_size(400, 0, imgui.ONCE)
         imgui.begin("Terrain Editor", True)
 
         imgui.text("Mode: {}".format("Look/Fly (RMB held)" if looking else "Edit (LMB paints)"))
@@ -2020,15 +2196,17 @@ def main():
                 imgui.push_item_width(-1)
                 _, import_path = imgui.input_text("##foliage_import_path", import_path, 512)
                 imgui.pop_item_width()
-                if imgui.button("Browse..."):
+                if imgui.button("Browse...##foliage"):
                     dialog_worked, picked = browse_for_model_file()
                     if dialog_worked:
                         if picked:
                             import_path = picked
                     else:
+                        browser_target = "foliage"
                         show_inapp_browser = True
                 imgui.same_line()
-                if imgui.button("Browse (in-app)"):
+                if imgui.button("Browse (in-app)##foliage"):
+                    browser_target = "foliage"
                     show_inapp_browser = True
                 _, import_name = imgui.input_text("Name", import_name, 64)
                 _, import_min_h = imgui.slider_float("Min height", import_min_h, -2.0, 2.0)
@@ -2103,6 +2281,26 @@ def main():
                 if imgui.button("Clear Points"):
                     road.clear()
 
+                # -- diverge / branch: start a brand new road at the
+                # currently-selected point of this road, for forks and
+                # junctions without hand-matching coordinates --
+                imgui.same_line()
+                branch_disabled = road.selected_point < 0
+                if branch_disabled:
+                    imgui.push_style_var(imgui.STYLE_ALPHA, 0.5)
+                if imgui.button("Branch New Road Here") and not branch_disabled:
+                    branch_pos = road.points[road.selected_point].copy()
+                    new_road = RoadSpline("Road {}".format(len(roads) + 1))
+                    new_road.add_point(branch_pos)
+                    new_road.half_width = road.half_width
+                    new_road.affect_width = road.affect_width
+                    roads.append(new_road)
+                    active_road_idx = len(roads) - 1
+                    road = new_road
+                if branch_disabled:
+                    imgui.pop_style_var()
+                    imgui.text_disabled("(select a point on this road to branch from it)")
+
                 imgui.text_wrapped(
                     "{} control point(s). Click empty ground to add a point, "
                     "click + drag an existing point to move it, Delete key "
@@ -2111,6 +2309,14 @@ def main():
 
                 imgui.separator()
                 imgui.text("Road Shape")
+                changed_closed, new_closed = imgui.checkbox("Complete Track (closed loop)", road.closed)
+                if changed_closed:
+                    road.set_closed(new_closed)
+                    road.apply_to_terrain(terrain)
+                    foliage.update_all(terrain)
+                if road.closed and len(road.points) < 3:
+                    imgui.text_disabled("(needs at least 3 points to close into a loop)")
+
                 changed_w, road.half_width = imgui.slider_float("Width", road.half_width, 0.5, 10.0)
                 changed_a, road.affect_width = imgui.slider_float("Terrain blend margin", road.affect_width, 0.0, 10.0)
                 changed_h, road.height_offset = imgui.slider_float("Mesh height offset", road.height_offset, 0.0, 0.5)
@@ -2127,23 +2333,111 @@ def main():
                 )
 
                 imgui.separator()
-                imgui.text("Modular Props")
-                _, road.props_enabled = imgui.checkbox("Enable props", road.props_enabled)
-                prop_type_idx = ROAD_PROP_TYPE_KEYS.index(road.prop_type)
-                changed_pt, prop_type_idx = imgui.combo("Prop type", prop_type_idx, ROAD_PROP_TYPE_LABELS)
-                if changed_pt:
-                    road.prop_type = ROAD_PROP_TYPE_KEYS[prop_type_idx]
-                    road.mark_dirty()
-                side_options = ["left", "right", "both"]
-                side_idx = side_options.index(road.prop_side)
-                changed_side, side_idx = imgui.combo("Side", side_idx, ["Left", "Right", "Both"])
-                if changed_side:
-                    road.prop_side = side_options[side_idx]
-                    road.mark_dirty()
-                changed_sp, road.prop_spacing = imgui.slider_float("Spacing", road.prop_spacing, 0.5, 15.0)
-                changed_of, road.prop_offset = imgui.slider_float("Offset from edge", road.prop_offset, 0.0, 3.0)
-                if changed_sp or changed_of:
-                    road.mark_dirty()
+                imgui.text("Modular Props ({} layer(s))".format(len(road.prop_layers)))
+                imgui.text_wrapped(
+                    "Stack as many layers as you like on one road - e.g. a "
+                    "fence layer plus a lamp layer - instead of making a "
+                    "new road per prop type. Each instance's rotation is "
+                    "computed from the road's curve right at that point, "
+                    "so it turns to follow every bend."
+                )
+                layer_to_remove = -1
+                for li, layer in enumerate(road.prop_layers):
+                    imgui.push_id("proplayer_{}".format(li))
+                    label = "{} - {}".format(li + 1, ROAD_PROP_TYPE_LABELS[
+                        ROAD_PROP_TYPE_KEYS.index(layer["type"])
+                    ] if layer["type"] in ROAD_PROP_TYPE_KEYS else layer["type"])
+                    if imgui.tree_node(label):
+                        changed_en, layer["enabled"] = imgui.checkbox("Enabled", layer["enabled"])
+                        type_idx = ROAD_PROP_TYPE_KEYS.index(layer["type"]) if layer["type"] in ROAD_PROP_TYPE_KEYS else 0
+                        changed_ty, type_idx = imgui.combo("Type", type_idx, ROAD_PROP_TYPE_LABELS)
+                        if changed_ty:
+                            layer["type"] = ROAD_PROP_TYPE_KEYS[type_idx]
+                        side_options = ["left", "right", "both"]
+                        side_idx = side_options.index(layer["side"])
+                        changed_side, side_idx = imgui.combo("Side", side_idx, ["Left", "Right", "Both"])
+                        if changed_side:
+                            layer["side"] = side_options[side_idx]
+                        changed_sp, layer["spacing"] = imgui.slider_float("Spacing", layer["spacing"], 0.5, 15.0)
+                        changed_of, layer["offset"] = imgui.slider_float("Offset from edge", layer["offset"], 0.0, 3.0)
+                        changed_yo, layer["yaw_offset"] = imgui.slider_float(
+                            "Rotation offset (deg)", layer["yaw_offset"], -180.0, 180.0
+                        )
+                        if changed_en or changed_ty or changed_side or changed_sp or changed_of or changed_yo:
+                            road.mark_dirty()
+                        if imgui.button("Remove layer"):
+                            layer_to_remove = li
+                        imgui.tree_pop()
+                    imgui.pop_id()
+                if layer_to_remove >= 0:
+                    road.remove_prop_layer(layer_to_remove)
+
+                if imgui.button("Add Prop Layer"):
+                    road.add_prop_layer()
+
+                imgui.separator()
+                if imgui.tree_node("Import custom road prop (.obj)"):
+                    imgui.text_wrapped(
+                        "Same pipeline as foliage import: a Sketchfab OBJ "
+                        "download or a Blender export (File > Export > "
+                        "Wavefront .obj). Once imported it shows up as a "
+                        "new option in every road's prop-layer Type dropdown, "
+                        "right next to Fence and Lamp."
+                    )
+                    imgui.text("File path:")
+                    imgui.push_item_width(-1)
+                    _, road_import_path = imgui.input_text("##road_import_path", road_import_path, 512)
+                    imgui.pop_item_width()
+                    if imgui.button("Browse...##roadprop"):
+                        dialog_worked, picked = browse_for_model_file()
+                        if dialog_worked:
+                            if picked:
+                                road_import_path = picked
+                        else:
+                            browser_target = "road_prop"
+                            show_inapp_browser = True
+                    imgui.same_line()
+                    if imgui.button("Browse (in-app)##roadprop"):
+                        browser_target = "road_prop"
+                        show_inapp_browser = True
+                    _, road_import_name = imgui.input_text("Name##roadprop", road_import_name, 64)
+                    _, road_import_height = imgui.slider_float("Model height", road_import_height, 0.1, 4.0)
+                    fwd_idx = road_import_forward_options.index(road_import_forward)
+                    changed_fwd, fwd_idx = imgui.combo(
+                        "Forward axis", fwd_idx, road_import_forward_options
+                    )
+                    if changed_fwd:
+                        road_import_forward = road_import_forward_options[fwd_idx]
+                    imgui.text_wrapped(
+                        "If the imported model looks rotated 90/180 degrees "
+                        "from the road direction once placed, change Forward "
+                        "axis (or nudge a layer's Rotation offset) rather "
+                        "than re-exporting the model."
+                    )
+                    _, road_import_color = imgui.color_edit3("Tint color##roadprop", *road_import_color)
+                    if imgui.button("Import as new road prop type"):
+                        if road_import_path and os.path.isfile(road_import_path):
+                            try:
+                                new_key = register_custom_road_prop(
+                                    road_prop_lists,
+                                    road_import_name or "Custom Prop",
+                                    road_import_path,
+                                    color=road_import_color,
+                                    target_height=road_import_height,
+                                    forward_axis=road_import_forward,
+                                )
+                                road_import_status = "Imported '{}' as a new road prop type.".format(road_import_name)
+                                # convenience: add a ready-to-use layer with the new type
+                                new_li = road.add_prop_layer(new_key)
+                                road.prop_layers[new_li]["type"] = new_key
+                                road.mark_dirty()
+                            except Exception as e:
+                                road_import_status = "Import failed: {}".format(e)
+                        else:
+                            road_import_status = "That file path doesn't exist - check it or use Browse..."
+                    if road_import_status:
+                        imgui.text_wrapped(road_import_status)
+                    imgui.tree_pop()
             else:
                 imgui.text_wrapped("No road yet - click 'New Road' to start placing points.")
 
@@ -2194,11 +2488,17 @@ def main():
         imgui.end()
 
         if show_inapp_browser:
-            show_inapp_browser, browse_dir, picked_file = draw_inapp_browser(browse_dir)
+            title = "Select Road Prop Model (.obj)" if browser_target == "road_prop" else "Select Foliage Model (.obj)"
+            show_inapp_browser, browse_dir, picked_file = draw_inapp_browser(browse_dir, title=title)
             if picked_file:
-                import_path = picked_file
-                import_status = "Selected: " + picked_file
+                if browser_target == "road_prop":
+                    road_import_path = picked_file
+                    road_import_status = "Selected: " + picked_file
+                else:
+                    import_path = picked_file
+                    import_status = "Selected: " + picked_file
                 show_inapp_browser = False
+                browser_target = None
 
         # ---- camera look (only while RMB held) ----
         if looking:
@@ -2335,7 +2635,7 @@ def main():
 
         for road in roads:
             draw_road_mesh(road, road_texture)
-            if road.props_enabled:
+            if road.prop_layers:
                 draw_road_props(road, road_prop_lists)
 
         if tool_idx == 3 and roads:
