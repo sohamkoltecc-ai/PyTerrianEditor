@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import numpy as np
 import pygame
@@ -174,6 +175,51 @@ class Terrain:
     def in_bounds_grid(self, gx, gz):
         return 0 <= gx <= self.width - 1 and 0 <= gz <= self.height - 1
 
+    # -- resolution / detail level -------------------------------------------
+
+    def resample_like(self, new_width, new_height):
+        """Builds a new Terrain at a different grid resolution ("detail
+        level"), bilinearly resampling this terrain's heights onto the new
+        grid so the overall shape survives a resolution change instead of
+        being thrown away and regenerated from scratch. Splat-texture
+        weights and foliage are NOT carried over here - the caller is
+        expected to rebuild/re-glue those against the returned terrain."""
+        new_terrain = Terrain.__new__(Terrain)
+        new_terrain.width = new_width
+        new_terrain.height = new_height
+        new_terrain.scale = self.scale
+        new_terrain.seed = self.seed
+
+        n = new_width * new_height
+        new_terrain.vertices = np.zeros((n, 3), dtype="float32")
+        new_terrain.normals = np.zeros((n, 3), dtype="float32")
+        new_terrain.colors = np.zeros((n, 3), dtype="float32")
+
+        xs = np.arange(new_width) - new_width / 2.0
+        zs = np.arange(new_height) - new_height / 2.0
+        grid_x, grid_z = np.meshgrid(xs, zs)
+        new_terrain.vertices[:, 0] = grid_x.flatten()
+        new_terrain.vertices[:, 2] = grid_z.flatten()
+
+        new_terrain.tris = Terrain._build_triangles(new_width, new_height)
+        new_terrain.line_indices = Terrain._build_line_indices(new_width, new_height)
+
+        # map each new grid cell to the equivalent fractional coordinate in
+        # THIS (old) grid and bilinearly sample its height there, so going
+        # to a higher or lower resolution keeps roughly the same landscape
+        # (and any sculpting already done) instead of discarding it
+        old_w, old_h = self.width, self.height
+        fx = np.linspace(0.0, old_w - 1.000001, new_width)
+        fz = np.linspace(0.0, old_h - 1.000001, new_height)
+        heights = np.empty((new_height, new_width), dtype="float32")
+        for zi in range(new_height):
+            gz = fz[zi]
+            for xi in range(new_width):
+                heights[zi, xi] = self.height_at(fx[xi], gz)
+        new_terrain.vertices[:, 1] = heights.flatten()
+        new_terrain.recompute_derived()
+        return new_terrain
+
     # -- picking (raymarch against the heightmap) ---------------------------
 
     def raycast(self, origin, direction, max_dist=150.0, step=0.5):
@@ -243,6 +289,294 @@ class Terrain:
 
 
 # ---------------------------------------------------------------------------
+# Terrain texture painting (Unity-style splat mapping)
+# ---------------------------------------------------------------------------
+#
+# Each vertex carries a 4-component weight (grass/dirt/rock/sand). The
+# fragment shader normalizes these and blends the four tiled textures
+# accordingly, exactly like Unity's terrain "Paint Texture" tool. Painting
+# nudges the weights at the brushed vertices toward the selected layer
+# (with the others shrinking proportionally) using the same cosine falloff
+# as the sculpt brush, so strokes feel consistent across tools.
+
+TERRAIN_LAYER_KEYS = ["grass", "dirt", "rock", "sand"]  # dict keys used in terrain_tex_ids
+
+
+class TerrainTextures:
+    LAYER_NAMES = ["Grass", "Dirt", "Rock", "Sand"]
+
+    def __init__(self, terrain, tile_scale=6.0):
+        self.tile_scale = tile_scale
+        self.weights = np.zeros((len(terrain.vertices), 4), dtype="float32")
+        self.initialize_from_height_slope(terrain)
+
+    def initialize_from_height_slope(self, terrain):
+        """Seed sensible starting weights so the terrain looks reasonable
+        before any manual painting: grass on mid-height gentle slopes,
+        rock on steep slopes, sand in low areas, dirt filling the rest."""
+        y = terrain.vertices[:, 1]
+        up = np.clip(terrain.normals[:, 1], 0.0, 1.0)
+        y_min, y_max = float(y.min()), float(y.max())
+        span = max(y_max - y_min, 1e-6)
+        t = np.clip((y - y_min) / span, 0.0, 1.0)
+
+        grass = np.clip(1.0 - np.abs(t - 0.45) * 2.2, 0.0, 1.0) * up
+        sand = np.clip((0.25 - t) * 4.0, 0.0, 1.0)
+        rock = np.clip((1.0 - up) * 2.0, 0.0, 1.0)
+        dirt = np.clip(1.0 - grass - sand - rock, 0.05, 1.0)
+
+        w = np.stack([grass, dirt, rock, sand], axis=1)
+        wsum = w.sum(axis=1, keepdims=True)
+        wsum[wsum < 1e-6] = 1.0
+        self.weights = (w / wsum).astype("float32")
+
+    def paint(self, terrain, hit_point, radius, strength, layer_idx):
+        hx, hz = hit_point[0], hit_point[2]
+        vx = terrain.vertices[:, 0]
+        vz = terrain.vertices[:, 2]
+        dist = np.sqrt((vx - hx) ** 2 + (vz - hz) ** 2)
+        mask = dist <= radius
+        if not np.any(mask):
+            return
+
+        falloff = 0.5 * (1.0 + np.cos(np.pi * (dist[mask] / radius)))
+        amount = np.clip(strength * falloff, 0.0, 1.0)[:, None]
+
+        target = np.zeros(4, dtype="float32")
+        target[layer_idx] = 1.0
+
+        w = self.weights[mask]
+        self.weights[mask] = w + (target[None, :] - w) * amount
+
+
+# ---------------------------------------------------------------------------
+# Procedural textures (no external image assets required)
+# ---------------------------------------------------------------------------
+
+def _value_noise(size, cell, rng):
+    """Smooth value noise: a coarse random grid, bilinearly upsampled."""
+    grid_n = max(size // cell, 2)
+    grid = rng.random((grid_n + 1, grid_n + 1)).astype("float32")
+    ys = np.linspace(0, grid_n - 1e-6, size)
+    xs = np.linspace(0, grid_n - 1e-6, size)
+    gy, gx = np.meshgrid(ys, xs, indexing="ij")
+    y0 = gy.astype(int)
+    x0 = gx.astype(int)
+    y1 = np.clip(y0 + 1, 0, grid_n)
+    x1 = np.clip(x0 + 1, 0, grid_n)
+    ty = (gy - y0)[..., None]
+    tx = (gx - x0)[..., None]
+    v00 = grid[y0, x0][..., None]
+    v10 = grid[y0, x1][..., None]
+    v01 = grid[y1, x0][..., None]
+    v11 = grid[y1, x1][..., None]
+    v0 = v00 * (1 - tx) + v10 * tx
+    v1 = v01 * (1 - tx) + v11 * tx
+    return (v0 * (1 - ty) + v1 * ty)[..., 0]
+
+
+def generate_texture(base_color, size=256, seed=0, streaks=False, speckle=False):
+    """Builds a tileable-ish procedural albedo texture by layering value
+    noise at a few octaves on top of a base color."""
+    rng = np.random.default_rng(seed)
+    n1 = _value_noise(size, 6, rng)
+    n2 = _value_noise(size, 20, rng)
+    n3 = _value_noise(size, 56, rng)
+    noise = n1 * 0.5 + n2 * 0.3 + n3 * 0.2
+    noise = (noise - noise.min()) / max(noise.max() - noise.min(), 1e-6)
+
+    base = np.array(base_color, dtype="float32")
+    variation = (noise[..., None] - 0.5) * 0.35
+    img = np.clip(base[None, None, :] + variation, 0.0, 1.0)
+
+    if streaks:
+        xs = np.linspace(0, 30.0, size)
+        stripe = (np.sin(xs) * 0.04)[None, :, None]
+        img = np.clip(img + stripe, 0.0, 1.0)
+
+    if speckle:
+        speck = (rng.random((size, size)) > 0.985)[..., None]
+        img = np.where(speck, np.clip(img + 0.25, 0.0, 1.0), img)
+
+    return (img * 255).astype("uint8")
+
+
+def create_gl_texture(image_rgb_uint8):
+    tex = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    h, w, _ = image_rgb_uint8.shape
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE,
+                 np.ascontiguousarray(image_rgb_uint8))
+    glGenerateMipmap(GL_TEXTURE_2D)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glBindTexture(GL_TEXTURE_2D, 0)
+    return tex
+
+
+def load_texture_from_file(path):
+    """Loads an arbitrary image file (png/jpg/bmp/...) from disk into a GL
+    texture - used for user-imported custom terrain-layer and road
+    textures (the "Browse..." buttons next to the procedural presets).
+    Tries Pillow first since it handles the widest range of formats;
+    falls back to pygame's own image loader (covers png/jpg/bmp with no
+    extra dependency) if Pillow isn't installed. Raises on failure so the
+    caller can show the error in the UI instead of silently no-oping."""
+    try:
+        from PIL import Image
+        img = Image.open(path).convert("RGB")
+        arr = np.array(img, dtype="uint8")
+        arr = np.flipud(arr)  # image row 0 is the top; GL texture row 0 is the bottom
+        return create_gl_texture(arr)
+    except ImportError:
+        surf = pygame.image.load(path)
+        surf = surf.convert_alpha() if surf.get_flags() & pygame.SRCALPHA else surf.convert()
+        w, h = surf.get_size()
+        raw = pygame.image.tostring(surf, "RGB", True)  # flipped=True flips vertically for GL
+        arr = np.frombuffer(raw, dtype="uint8").reshape((h, w, 3))
+        return create_gl_texture(arr)
+
+
+def build_terrain_textures():
+    """Must be called after the OpenGL context exists."""
+    return {
+        "grass": create_gl_texture(generate_texture((0.20, 0.42, 0.16), seed=1)),
+        "dirt": create_gl_texture(generate_texture((0.36, 0.24, 0.14), seed=2, speckle=True)),
+        "rock": create_gl_texture(generate_texture((0.42, 0.41, 0.40), seed=3, streaks=True)),
+        "sand": create_gl_texture(generate_texture((0.76, 0.69, 0.49), seed=4)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Terrain shader (4-layer splat blend + per-pixel lighting + distance fog)
+# ---------------------------------------------------------------------------
+
+TERRAIN_VERT_SRC = """
+#version 120
+attribute vec4 aWeights;
+varying vec3 vNormal;
+varying vec3 vWorldPos;
+varying vec4 vWeights;
+
+void main() {
+    vWorldPos = gl_Vertex.xyz;   // terrain has no model transform: object space == world space
+    vNormal = gl_Normal;
+    vWeights = aWeights;
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+}
+"""
+
+TERRAIN_FRAG_SRC = """
+#version 120
+uniform sampler2D texGrass;
+uniform sampler2D texDirt;
+uniform sampler2D texRock;
+uniform sampler2D texSand;
+uniform float texScale;
+uniform vec3 lightDir;
+uniform vec3 camPos;
+uniform vec3 fogColor;
+uniform float fogDensity;
+
+varying vec3 vNormal;
+varying vec3 vWorldPos;
+varying vec4 vWeights;
+
+void main() {
+    vec2 uv = vWorldPos.xz / texScale;
+    vec3 grass = texture2D(texGrass, uv).rgb;
+    vec3 dirt  = texture2D(texDirt,  uv).rgb;
+    vec3 rock  = texture2D(texRock,  uv).rgb;
+    vec3 sand  = texture2D(texSand,  uv).rgb;
+
+    vec4 w = max(vWeights, 0.0);
+    float wsum = w.x + w.y + w.z + w.w;
+    w = wsum > 0.0001 ? w / wsum : vec4(0.25, 0.25, 0.25, 0.25);
+
+    vec3 albedo = grass * w.x + dirt * w.y + rock * w.z + sand * w.w;
+
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(lightDir);
+    float diff = max(dot(N, L), 0.0);
+
+    // cheap ambient-occlusion proxy: steeper slopes read a touch darker
+    float ao = clamp(0.55 + 0.45 * N.y, 0.0, 1.0);
+
+    // subtle sheen on rock/sand fraction to sell a "wet/mineral" look
+    float sheen = (w.z + w.w * 0.5) * pow(diff, 2.0) * 0.15;
+
+    vec3 color = albedo * (0.32 * ao + 0.85 * diff) + sheen;
+
+    float dist = length(vWorldPos - camPos);
+    float fog = clamp(exp(-fogDensity * fogDensity * dist * dist), 0.0, 1.0);
+    color = mix(fogColor, color, fog);
+
+    gl_FragColor = vec4(color, 1.0);
+}
+"""
+
+
+def compile_shader(src, shader_type):
+    shader = glCreateShader(shader_type)
+    glShaderSource(shader, src)
+    glCompileShader(shader)
+    if not glGetShaderiv(shader, GL_COMPILE_STATUS):
+        raise RuntimeError(glGetShaderInfoLog(shader).decode())
+    return shader
+
+
+def build_shader_program(vert_src, frag_src):
+    vs = compile_shader(vert_src, GL_VERTEX_SHADER)
+    fs = compile_shader(frag_src, GL_FRAGMENT_SHADER)
+    program = glCreateProgram()
+    glAttachShader(program, vs)
+    glAttachShader(program, fs)
+    glLinkProgram(program)
+    if not glGetProgramiv(program, GL_LINK_STATUS):
+        raise RuntimeError(glGetProgramInfoLog(program).decode())
+    glDeleteShader(vs)
+    glDeleteShader(fs)
+    return program
+
+
+def draw_terrain_solid_textured(terrain, tex_ids, weights, program, uniforms,
+                                 cam_pos, tile_scale, light_dir, fog_color, fog_density):
+    glUseProgram(program)
+    glUniform1i(uniforms["texGrass"], 0)
+    glUniform1i(uniforms["texDirt"], 1)
+    glUniform1i(uniforms["texRock"], 2)
+    glUniform1i(uniforms["texSand"], 3)
+    glUniform1f(uniforms["texScale"], tile_scale)
+    glUniform3f(uniforms["lightDir"], *light_dir)
+    glUniform3f(uniforms["camPos"], *cam_pos)
+    glUniform3f(uniforms["fogColor"], *fog_color)
+    glUniform1f(uniforms["fogDensity"], fog_density)
+
+    for i, key in enumerate(("grass", "dirt", "rock", "sand")):
+        glActiveTexture(GL_TEXTURE0 + i)
+        glBindTexture(GL_TEXTURE_2D, tex_ids[key])
+
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_NORMAL_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, terrain.vertices)
+    glNormalPointer(GL_FLOAT, 0, terrain.normals)
+
+    loc = uniforms["aWeights"]
+    glEnableVertexAttribArray(loc)
+    glVertexAttribPointer(loc, 4, GL_FLOAT, GL_FALSE, 0, weights)
+
+    glDrawElements(GL_TRIANGLES, len(terrain.tris) * 3, GL_UNSIGNED_INT, terrain.tris)
+
+    glDisableVertexAttribArray(loc)
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glDisableClientState(GL_NORMAL_ARRAY)
+    glActiveTexture(GL_TEXTURE0)
+    glUseProgram(0)
+
+
+# ---------------------------------------------------------------------------
 # Foliage system
 # ---------------------------------------------------------------------------
 #
@@ -280,9 +614,18 @@ FOLIAGE_RULES = [
     dict(name="leaves",    min_h=-0.7, max_h=1.4, min_up=0.60, weight=0.11, scale=(0.7, 1.3)),
     dict(name="mud",       min_h=-1.2, max_h=-0.1, min_up=0.40, weight=0.08, scale=(0.8, 1.6)),
     dict(name="sand",      min_h=-1.2, max_h=-0.2, min_up=0.50, weight=0.08, scale=(0.9, 1.8)),
-    dict(name="rock",      min_h=-1.2, max_h=1.8, min_up=0.35, weight=0.09, scale=(0.5, 1.4)),
+    # Widened vs. the original (min_up=0.35, max_h=1.8): rock is the type
+    # that should realistically dominate steep mountain peaks, but those
+    # narrower bounds excluded most real peaks - which read close to
+    # min_up~0 and can top out well past 1.8 - leaving bare, foliage-less
+    # summits like the one in the screenshot. min_up=0.0 means "any
+    # slope, including a near-vertical cliff face" qualifies for rock.
+    dict(name="rock",      min_h=-1.5, max_h=3.0, min_up=0.0, weight=0.09, scale=(0.5, 1.4)),
     dict(name="flower",    min_h=-0.5, max_h=1.2, min_up=0.70, weight=0.07, scale=(0.6, 1.1)),
-    dict(name="dead tree", min_h=-0.4, max_h=1.0, min_up=0.65, weight=0.03, scale=(0.7, 1.3)),
+    # Widened for the same reason as rock: a few bare, weathered dead
+    # trees clinging to a steep slope read as natural, and this keeps
+    # peaks from being the one spot nothing can ever be painted on.
+    dict(name="dead tree", min_h=-0.4, max_h=2.5, min_up=0.30, weight=0.03, scale=(0.7, 1.3)),
 ]
 
 FOLIAGE_TYPE_LABELS = [r["name"].capitalize() for r in FOLIAGE_RULES] + ["All (mix)"]
@@ -300,6 +643,11 @@ class Foliage:
         self.rotations = np.zeros((0,), dtype="float32")
         self.scales = np.zeros((0,), dtype="float32")
         self.types = np.zeros((0,), dtype="int32")
+        # marks instances placed with "Force placement" (i.e. painted
+        # somewhere their type's normal height/slope rule would have
+        # rejected, such as a tree on a steep peak) so re-gluing never
+        # silently deletes them again the next time the terrain is edited
+        self.forced = np.zeros((0,), dtype=bool)
 
     def __len__(self):
         return len(self.positions)
@@ -339,6 +687,7 @@ class Foliage:
         self.rotations = np.array(rotations, dtype="float32")
         self.scales = np.array(scales, dtype="float32")
         self.types = np.array(types, dtype="int32")
+        self.forced = np.zeros(len(self.positions), dtype=bool)
 
     def _sample(self, terrain, gx, gz, rng):
         """Try to place one instance at (gx, gz), picking among whichever
@@ -366,16 +715,19 @@ class Foliage:
         scale = float(rng.uniform(lo, hi))
         return (gx, gz), wpos, rot, scale, ftype
 
-    def _sample_type(self, terrain, gx, gz, ftype, rng):
+    def _sample_type(self, terrain, gx, gz, ftype, rng, force=False):
         """Try to place one instance of a *specific* type at (gx, gz).
         Returns None if that type's placement rule isn't satisfied there
-        (e.g. painting sand on a steep cliff)."""
+        (e.g. painting sand on a steep cliff) - unless `force` is True, in
+        which case the rule check is skipped entirely so the person can
+        deliberately paint any type anywhere (e.g. trees on a mountain
+        peak that would normally be too steep)."""
         if not terrain.in_bounds_grid(gx, gz):
             return None
         h = float(terrain.height_at(gx, gz))
         up_y = float(terrain.normal_at(gx, gz)[1])
         rule = FOLIAGE_RULES[ftype]
-        if not (rule["min_h"] <= h <= rule["max_h"] and up_y >= rule["min_up"]):
+        if not force and not (rule["min_h"] <= h <= rule["max_h"] and up_y >= rule["min_up"]):
             return None
 
         wx = gx - terrain.width / 2.0
@@ -389,7 +741,7 @@ class Foliage:
     # -- user-driven painting ---------------------------------------------
 
     def add_instances(self, terrain, center, radius, count, type_filter, rng,
-                       min_spacing=0.4, soft_edge=True):
+                       min_spacing=0.4, soft_edge=True, force=False):
         """Paint new foliage within `radius` of `center`. `type_filter` is
         either a FOLIAGE_* index (place only that type, skipping spots
         where its rule fails) or FOLIAGE_ALL ("all") to mix every type
@@ -397,6 +749,12 @@ class Foliage:
         `count` candidate points are tried per call; candidates too close
         to an existing (or just-added) instance are skipped so holding the
         mouse down doesn't pile hundreds of instances on the same spot.
+
+        `force`, when True and `type_filter` is a specific type (not
+        "all"), bypasses that type's height/slope placement rule so it can
+        be painted anywhere, e.g. on a steep mountain peak. It has no
+        effect on the "All (mix)" option, which always respects the rules
+        so it doesn't pick a nonsensical type for the spot.
 
         When `soft_edge` is True, candidates are accepted with a cosine
         falloff based on their distance from `center` (dense in the middle,
@@ -423,7 +781,7 @@ class Foliage:
             if type_filter == FOLIAGE_ALL:
                 inst = self._sample(terrain, gx, gz, rng)
             else:
-                inst = self._sample_type(terrain, gx, gz, type_filter, rng)
+                inst = self._sample_type(terrain, gx, gz, type_filter, rng, force=force)
             if inst is None:
                 continue
             gpos, wpos, rot, scale, ftype = inst
@@ -454,6 +812,8 @@ class Foliage:
         self.rotations = np.concatenate([self.rotations, np.array(new_rot, dtype="float32")], axis=0)
         self.scales = np.concatenate([self.scales, np.array(new_scale, dtype="float32")], axis=0)
         self.types = np.concatenate([self.types, np.array(new_type, dtype="int32")], axis=0)
+        new_forced = np.full(len(new_pos), bool(force and type_filter != FOLIAGE_ALL), dtype=bool)
+        self.forced = np.concatenate([self.forced, new_forced], axis=0)
 
     def erase_instances(self, center, radius):
         """Remove any instances within `radius` of `center` (foliage eraser)."""
@@ -468,15 +828,16 @@ class Foliage:
             self.rotations = self.rotations[keep]
             self.scales = self.scales[keep]
             self.types = self.types[keep]
+            self.forced = self.forced[keep]
 
     # -- keeping foliage glued to an edited terrain -----------------------
 
     def update_region(self, terrain, center, radius):
         """Call after a sculpt brush stroke. Re-samples height/slope for
         every instance inside the affected radius: instances that still
-        satisfy their type's rule are re-glued to the new surface height,
-        and ones that don't (buried underwater, now on a cliff, etc.) are
-        removed."""
+        satisfy their type's rule (or were placed with "Force placement")
+        are re-glued to the new surface height, and ones that don't
+        (buried underwater, now on a cliff, etc.) are removed."""
         if len(self.positions) == 0:
             return
         cx, cz = center[0], center[2]
@@ -488,9 +849,9 @@ class Foliage:
         self._reglue(terrain, affected)
 
     def update_all(self, terrain):
-        """Call after a full terrain regeneration/flatten. Re-glues or
-        culls every existing instance against the new heightmap, without
-        adding any new foliage."""
+        """Call after a full terrain regeneration/flatten/resolution change.
+        Re-glues or culls every existing instance against the new
+        heightmap, without adding any new foliage."""
         if len(self.positions) == 0:
             return
         self._reglue(terrain, np.arange(len(self.positions)))
@@ -502,7 +863,13 @@ class Foliage:
             h = float(terrain.height_at(gx, gz))
             up_y = float(terrain.normal_at(gx, gz)[1])
             rule = FOLIAGE_RULES[int(self.types[i])]
-            if rule["min_h"] <= h <= rule["max_h"] and up_y >= rule["min_up"]:
+            satisfies = rule["min_h"] <= h <= rule["max_h"] and up_y >= rule["min_up"]
+            if satisfies or bool(self.forced[i]):
+                # forced instances (placed via "Force placement") stay
+                # glued to the terrain height even if a later sculpt
+                # stroke pushes the spot further outside their normal
+                # rule - only naturally-placed instances get culled when
+                # they no longer qualify
                 self.positions[i, 1] = h
             else:
                 keep_mask[i] = False
@@ -513,6 +880,7 @@ class Foliage:
             self.rotations = self.rotations[keep_mask]
             self.scales = self.scales[keep_mask]
             self.types = self.types[keep_mask]
+            self.forced = self.forced[keep_mask]
 
 
 # -- foliage prototype meshes (built once as OpenGL display lists) --------
@@ -861,21 +1229,887 @@ def draw_foliage(foliage, display_lists):
 
 
 # ---------------------------------------------------------------------------
-# Rendering (client-side vertex arrays, no shaders needed)
+# Custom model import (Sketchfab downloads / your own Blender exports)
 # ---------------------------------------------------------------------------
+#
+# Anyone can drop a .obj model into the "Import custom foliage" or
+# "Import custom road prop" panels and it becomes a brand-new paintable
+# type alongside the built-ins, with its own placement rules set right
+# there in the UI.
+#
+# Why .obj: it's the one format every relevant tool agrees on -
+# Sketchfab offers an "Original Format" / OBJ download for CC-licensed
+# models, and Blender exports it natively (File > Export > Wavefront
+# (.obj)). If a model only comes as .fbx/.gltf/.glb, open it in Blender
+# once and re-export as .obj - free, and it keeps this file dependency-free
+# (no fbx/gltf parser needed).
 
-def draw_terrain_solid(terrain):
+def load_obj_mesh(path):
+    """Minimal Wavefront OBJ parser. Returns (verts, norms, faces) where
+    verts/norms are lists of (x, y, z) tuples and faces is a list of
+    faces, each a list of (vertex_index, normal_index_or_None). Polygons
+    with more than 3 vertices are left as-is here and fan-triangulated by
+    the caller. UVs and materials are intentionally ignored - imported
+    props render as a flat tinted color, same as the built-in ones."""
+    verts, norms, faces = [], [], []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            tag = parts[0]
+            if tag == "v" and len(parts) >= 4:
+                verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif tag == "vn" and len(parts) >= 4:
+                norms.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif tag == "f":
+                face = []
+                for token in parts[1:]:
+                    idxs = token.split("/")
+                    vi = int(idxs[0])
+                    vi = vi - 1 if vi > 0 else len(verts) + vi
+                    ni = None
+                    if len(idxs) >= 3 and idxs[2]:
+                        ni = int(idxs[2])
+                        ni = ni - 1 if ni > 0 else len(norms) + ni
+                    face.append((vi, ni))
+                if len(face) >= 3:
+                    faces.append(face)
+    if not verts:
+        raise ValueError("No vertices found - is this a valid .obj file?")
+    if not faces:
+        raise ValueError("No faces found - the .obj has points but no geometry")
+    return verts, norms, faces
+
+
+def build_display_list_from_obj(path, target_height=1.0, color=(0.35, 0.45, 0.22), forward_axis="+X"):
+    """Loads an .obj, recenters it on X/Z, drops it onto Y=0, uniformly
+    rescales it to `target_height` tall, and compiles it into a GL display
+    list exactly like the built-in _build_*_list() functions - so it can
+    be dropped straight into the same foliage/road-prop display-list dict
+    and drawn/instanced identically to the built-ins.
+
+    `forward_axis` tells us which local axis the model was authored to
+    "face" (its front, e.g. the direction a fence panel runs, or a lamp's
+    "into the road" side). Road props are rotated at draw time so this
+    axis lines up with the road's tangent direction, which is what keeps
+    a fence's orientation glued to the curve as the road bends - if an
+    imported model looks rotated 90 degrees off from the road, this is
+    the knob to fix it rather than the placement math."""
+    verts, norms, faces = load_obj_mesh(path)
+    v_arr = np.array(verts, dtype="float64")
+
+    min_y, max_y = float(v_arr[:, 1].min()), float(v_arr[:, 1].max())
+    span = max(max_y - min_y, 1e-6)
+    scale = target_height / span
+    cx = (float(v_arr[:, 0].min()) + float(v_arr[:, 0].max())) / 2.0
+    cz = (float(v_arr[:, 2].min()) + float(v_arr[:, 2].max())) / 2.0
+
+    # pre-rotate around Y so the model's chosen "forward" axis becomes +X,
+    # which is the axis every draw call aligns to the tangent/yaw.
+    axis_yaw = {"+X": 0.0, "+Z": -math.pi / 2.0, "-X": math.pi, "-Z": math.pi / 2.0}.get(forward_axis, 0.0)
+    cos_a, sin_a = math.cos(axis_yaw), math.sin(axis_yaw)
+
+    def xform(v):
+        x = (v[0] - cx) * scale
+        y = (v[1] - min_y) * scale
+        z = (v[2] - cz) * scale
+        rx = x * cos_a - z * sin_a
+        rz = x * sin_a + z * cos_a
+        return (rx, y, rz)
+
+    def xform_normal(n):
+        nx, ny, nz = n
+        rx = nx * cos_a - nz * sin_a
+        rz = nx * sin_a + nz * cos_a
+        return (rx, ny, rz)
+
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glColor3f(*color)
+    glBegin(GL_TRIANGLES)
+    for face in faces:
+        # fan-triangulate n-gons
+        for i in range(1, len(face) - 1):
+            tri = (face[0], face[i], face[i + 1])
+            pts = [xform(verts[vi]) for vi, _ in tri]
+            if all(ni is not None for _, ni in tri):
+                for (vi, ni), p in zip(tri, pts):
+                    n = xform_normal(norms[ni])
+                    glNormal3f(n[0], n[1], n[2])
+                    glVertex3f(*p)
+            else:
+                # no vertex normals in the file - use the flat face normal
+                p0, p1, p2 = (np.array(p) for p in pts)
+                n = np.cross(p1 - p0, p2 - p0)
+                nl = np.linalg.norm(n)
+                n = (n / nl) if nl > 1e-8 else np.array([0.0, 1.0, 0.0])
+                for p in pts:
+                    glNormal3f(float(n[0]), float(n[1]), float(n[2]))
+                    glVertex3f(*p)
+    glEnd()
+    glEndList()
+    return list_id
+
+
+def register_custom_foliage(display_lists, name, model_path, min_h, max_h, min_up,
+                             scale_range, color=(0.35, 0.45, 0.22), target_height=1.0):
+    """Loads `model_path` as a new foliage type and appends it to the
+    global FOLIAGE_RULES / FOLIAGE_TYPE_LABELS so it shows up in the
+    "Type" dropdown of the foliage brush right alongside the built-ins.
+    Returns the new type's index (to select it automatically)."""
+    list_id = build_display_list_from_obj(model_path, target_height=target_height, color=color)
+    new_idx = len(FOLIAGE_RULES)
+    display_lists[new_idx] = list_id
+    FOLIAGE_RULES.append(dict(
+        name=name, min_h=min_h, max_h=max_h, min_up=min_up, weight=0.1, scale=scale_range,
+    ))
+    # mutate in place (slice assignment) so every existing reference to
+    # this list - e.g. the imgui.combo() call in main() - sees the update
+    FOLIAGE_TYPE_LABELS[:] = [r["name"].capitalize() for r in FOLIAGE_RULES] + ["All (mix)"]
+    return new_idx
+
+
+def _unique_prop_key(base_name):
+    """Turns a user-typed name into a safe, unique dict key for
+    ROAD_PROP_TYPE_KEYS (e.g. "My Fence!" -> "my_fence", or "my_fence_2"
+    if that key is already taken)."""
+    base = "".join(c.lower() if c.isalnum() else "_" for c in base_name).strip("_") or "prop"
+    while "__" in base:
+        base = base.replace("__", "_")
+    key = base
+    i = 2
+    while key in ROAD_PROP_TYPE_KEYS:
+        key = "{}_{}".format(base, i)
+        i += 1
+    return key
+
+
+def register_custom_road_prop(display_lists, name, model_path, color=(0.4, 0.4, 0.42),
+                               target_height=1.0, forward_axis="+X"):
+    """Loads `model_path` as a new road-prop type (a custom fence, guard
+    rail, bollard, streetlamp, whatever) and appends it to the global
+    ROAD_PROP_TYPE_KEYS / ROAD_PROP_TYPE_LABELS so it shows up in every
+    road's prop-layer "Type" dropdown right alongside Fence/Lamp. Returns
+    the new type's key (used to select it in a prop layer)."""
+    key = _unique_prop_key(name)
+    list_id = build_display_list_from_obj(
+        model_path, target_height=target_height, color=color, forward_axis=forward_axis
+    )
+    display_lists[key] = list_id
+    ROAD_PROP_TYPE_KEYS.append(key)
+    ROAD_PROP_TYPE_LABELS.append(name)
+    return key
+
+
+def browse_for_file(title, filetypes):
+    """Tries to open a native "Open File" dialog via Tkinter, filtered to
+    `filetypes` (a list of (label, pattern) tuples, as tkinter.filedialog
+    expects). Returns (True, path) if the dialog opened normally (path is
+    "" if the person cancelled it), or (False, "") if Tkinter isn't
+    available/working on this system - in which case the caller should
+    fall back to the built-in in-app browser (draw_inapp_browser below),
+    which has no dependency on Tkinter at all."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        root.destroy()
+        return True, path
+    except Exception as e:
+        print("Native file dialog unavailable ({}); using the in-app browser instead.".format(e))
+        return False, ""
+
+
+def browse_for_model_file():
+    return browse_for_file(
+        "Select a model", [("Wavefront OBJ", "*.obj"), ("All files", "*.*")]
+    )
+
+
+def browse_for_image_file():
+    return browse_for_file(
+        "Select a texture image",
+        [("Images", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")],
+    )
+
+
+# -- in-app (Tkinter-free) file browser, used automatically whenever the ---
+# -- native dialog above isn't available (e.g. Tkinter not installed) -----
+# -- Shared between the foliage importer, the road-prop importer, and the -
+# -- texture importers: the caller passes/receives a `target` tag so the --
+# -- picked path is routed back to the right panel. ------------------------
+
+def list_dir_entries(directory, extensions=(".obj",)):
+    """Returns (subdirs, matching_files), both sorted, for `directory`.
+    `extensions` may be a single string or a tuple/list of extensions, so
+    the same browser can filter for .obj models or for image files
+    (.png/.jpg/...). Returns ([], []) if the directory can't be read (bad
+    path, permissions, a drive that no longer exists, etc.) so the browser
+    can show an error instead of crashing."""
+    if isinstance(extensions, str):
+        extensions = (extensions,)
+    extensions = tuple(e.lower() for e in extensions)
+    try:
+        entries = os.listdir(directory)
+    except Exception:
+        return [], []
+    subdirs = sorted(
+        e for e in entries
+        if not e.startswith(".") and os.path.isdir(os.path.join(directory, e))
+    )
+    files = sorted(e for e in entries if e.lower().endswith(extensions))
+    return subdirs, files
+
+
+def default_browse_start_dir():
+    """Starts in ~/Downloads when it exists (where a Sketchfab .zip is
+    usually extracted to), otherwise the home directory."""
+    home = os.path.expanduser("~")
+    downloads = os.path.join(home, "Downloads")
+    return downloads if os.path.isdir(downloads) else home
+
+
+def draw_inapp_browser(browse_dir, title="Select Model (.obj)", extensions=(".obj",)):
+    """Renders the fallback in-app file browser window. Sizes and centers
+    itself against the *current* window/display size every time it's
+    opened (imgui.APPEARING), so it always fits on screen instead of
+    being clipped when the app window is small. `extensions` filters which
+    files show up in the list (models for the foliage/road-prop importers,
+    images for the texture importers). Returns
+    (still_open, new_browse_dir, picked_file_path_or_None)."""
+    picked = None
+    io = imgui.get_io()
+    disp_w, disp_h = io.display_size
+    # fit inside the current window with a margin, but don't go below a
+    # usable minimum - if the window is *very* small the browser will be
+    # tight, but it will never be pushed off-screen or unreadable
+    margin = 40
+    win_w = max(260, min(460, disp_w - margin))
+    win_h = max(220, min(420, disp_h - margin))
+    imgui.set_next_window_size(win_w, win_h, imgui.APPEARING)
+    imgui.set_next_window_position(
+        max(0, (disp_w - win_w) / 2.0), max(0, (disp_h - win_h) / 2.0), imgui.APPEARING
+    )
+    expanded, still_open = imgui.begin(title, True)
+    if expanded:
+        imgui.text_wrapped("Folder: " + browse_dir)
+        imgui.push_item_width(-70)
+        changed, new_path = imgui.input_text("##browser_path", browse_dir, 512)
+        imgui.pop_item_width()
+        if changed:
+            browse_dir = new_path
+        imgui.same_line()
+        if imgui.button("Go"):
+            if not os.path.isdir(browse_dir):
+                browse_dir = default_browse_start_dir()
+
+        if imgui.button(".. (up one level)"):
+            parent = os.path.dirname(browse_dir.rstrip(os.sep) or os.sep)
+            browse_dir = parent if parent else browse_dir
+
+        imgui.separator()
+        subdirs, files = list_dir_entries(browse_dir, extensions)
+        # let the list fill whatever vertical space is left in the window
+        list_h = max(100, imgui.get_content_region_available()[1])
+        imgui.begin_child("browser_entries", 0, list_h, border=True)
+        if not subdirs and not files:
+            imgui.text_disabled("(no subfolders or matching files here)")
+        for d in subdirs:
+            clicked, _ = imgui.selectable("[folder] " + d, False)
+            if clicked:
+                browse_dir = os.path.join(browse_dir, d)
+        for fname in files:
+            clicked, _ = imgui.selectable(fname, False)
+            if clicked:
+                picked = os.path.join(browse_dir, fname)
+        imgui.end_child()
+    imgui.end()
+    return still_open, browse_dir, picked
+
+
+# ---------------------------------------------------------------------------
+# Road / spline system (Unreal-style spline tool)
+# ---------------------------------------------------------------------------
+#
+# A RoadSpline is a chain of editable control points (world-space x/y/z).
+# A smooth Catmull-Rom curve is evaluated through them to build:
+#   1. a textured ribbon mesh (the road surface itself) - which can be an
+#      open path or a closed loop ("Complete Track"), using whichever
+#      texture (procedural preset or user-imported image) is selected for
+#      that road
+#   2. a terrain deformation mask that flattens the ground under the road
+#      and blends it smoothly into the surrounding terrain over a
+#      separately-adjustable margin ("affect width")
+#   3. any number of independent modular-prop *layers* (e.g. one layer of
+#      fences plus a second layer of lamp posts) scattered along the road
+#      edges at each layer's own spacing/offset, exactly like the foliage
+#      brush but constrained to run parallel to the spline. Every prop
+#      instance's yaw is derived from the spline's tangent at that point,
+#      so it always faces along the curve's actual direction - including
+#      through turns - rather than using one fixed rotation for the whole
+#      road.
+#
+# Roads can also branch off one another: picking a control point on an
+# existing road and using "Branch New Road Here" starts a brand new
+# RoadSpline at that same position, so you can build forks/junctions
+# without having to line up coordinates by hand.
+#
+# Everything derived (mesh/props/terrain target heights) is cached and
+# only recomputed when the spline is marked dirty (a point moved/added/
+# removed, a shape parameter changed, or the loop toggled), so editing
+# stays responsive even with a fairly dense terrain grid.
+
+def catmull_rom_point(p0, p1, p2, p3, t):
+    """Standard centripetal-ish (uniform) Catmull-Rom interpolation between
+    p1 and p2, using p0/p3 as the tangent-defining neighbors."""
+    t2 = t * t
+    t3 = t2 * t
+    return 0.5 * (
+        (2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+
+
+class RoadSpline:
+    """A single editable road: control points -> smooth curve -> mesh +
+    terrain carve + modular prop layers. Multiple independent RoadSpline
+    instances can coexist (see the "Road Editor" tool in main())."""
+
+    STEPS_PER_SEGMENT = 12  # curve smoothness between consecutive control points
+
+    def __init__(self, name="Road"):
+        self.name = name
+        self.points = []  # list of float64 np.array([x, y, z])
+
+        # -- shape / terrain interaction --
+        self.half_width = 2.5
+        self.affect_width = 3.0     # extra terrain blend margin beyond the road edge
+        self.height_offset = 0.05   # mesh sits slightly above the carved terrain (avoids z-fighting)
+        self.uv_tile_length = 4.0   # world units per texture repeat along the road
+
+        # -- which texture this road renders with: a key into the shared
+        # road-texture dict (procedural presets like "Asphalt"/"Dirt Road",
+        # or the filename-derived key of a user-imported image) --
+        self.texture_key = "Asphalt"
+
+        # -- "Complete Track": when True the spline loops back from the
+        # last point to the first, closing the mesh/terrain-carve/props
+        # into a continuous circuit instead of an open-ended path --
+        self.closed = False
+
+        # -- modular props: an ordered list of independent layers, e.g.
+        # [{"type": "fence", ...}, {"type": "lamp", ...}] so a single road
+        # can carry a fence line AND a row of lamp posts together instead
+        # of needing a second road just to add a second prop type --
+        self.prop_layers = []
+
+        self.selected_point = -1
+
+        self._dirty = True
+        self._samples = []
+        self._mesh = None            # (verts, normals, uvs, tris) or None
+        self._prop_instances = []    # list of (pos, yaw_radians, side, prop_type_key)
+
+    # -- editing ----------------------------------------------------------
+
+    def add_point(self, pos):
+        self.points.append(np.array(pos, dtype="float64"))
+        self._dirty = True
+        return len(self.points) - 1
+
+    def move_point(self, idx, pos):
+        if 0 <= idx < len(self.points):
+            self.points[idx] = np.array(pos, dtype="float64")
+            self._dirty = True
+
+    def remove_point(self, idx):
+        if 0 <= idx < len(self.points):
+            del self.points[idx]
+            self._dirty = True
+        self.selected_point = -1
+
+    def clear(self):
+        self.points = []
+        self.selected_point = -1
+        self._dirty = True
+
+    def mark_dirty(self):
+        self._dirty = True
+
+    def set_closed(self, closed):
+        """Toggle "Complete Track": stitches the last control point back
+        to the first so the road forms a closed loop (a full circuit)
+        instead of stopping at its two ends."""
+        self.closed = bool(closed)
+        self._dirty = True
+
+    # -- modular prop layers ------------------------------------------------
+
+    def add_prop_layer(self, prop_type=None):
+        """Adds a new independent prop layer (e.g. a fence line or a row
+        of lamp posts) to this road. Multiple layers stack, so one road
+        can carry a fence AND lamps AND a custom-imported prop all at
+        once instead of needing a separate road per prop type."""
+        if prop_type is None:
+            prop_type = ROAD_PROP_TYPE_KEYS[0] if ROAD_PROP_TYPE_KEYS else "fence"
+        self.prop_layers.append({
+            "type": prop_type,
+            "enabled": True,
+            "spacing": 3.0,
+            "side": "both",        # "left" | "right" | "both"
+            "offset": 0.3,         # extra gap beyond half_width before placing this layer's props
+            "yaw_offset": 0.0,     # degrees, on top of the tangent-derived rotation (fixes mis-authored models)
+        })
+        self._dirty = True
+        return len(self.prop_layers) - 1
+
+    def remove_prop_layer(self, idx):
+        if 0 <= idx < len(self.prop_layers):
+            del self.prop_layers[idx]
+        self._dirty = True
+
+    def pick_point(self, ray_origin, ray_dir, pick_radius=0.6, max_dist=200.0):
+        """Ray-sphere test against every control point (world space).
+        Returns the index of the closest hit point along the ray, or -1."""
+        best_idx = -1
+        best_t = max_dist
+        for i, p in enumerate(self.points):
+            oc = ray_origin - p
+            b = float(np.dot(oc, ray_dir))
+            c = float(np.dot(oc, oc)) - pick_radius * pick_radius
+            disc = b * b - c
+            if disc < 0.0:
+                continue
+            sqrt_disc = math.sqrt(disc)
+            t = -b - sqrt_disc
+            if t < 0.0:
+                t = -b + sqrt_disc
+            if 0.0 <= t < best_t:
+                best_t = t
+                best_idx = i
+        return best_idx
+
+    def resnap_points_to_terrain(self, terrain):
+        """Re-sample each point's height from the terrain (call after a
+        full terrain regenerate/flatten/resolution change so the road
+        doesn't float or clip through the new ground before
+        apply_to_terrain re-carves it)."""
+        for p in self.points:
+            gx, gz = terrain.world_to_grid(p[0], p[2])
+            if terrain.in_bounds_grid(gx, gz):
+                p[1] = terrain.height_at(gx, gz)
+        self._dirty = True
+
+    # -- sampling / derived data -------------------------------------------
+
+    def get_samples(self):
+        if self._dirty:
+            self._rebuild()
+        return self._samples
+
+    def get_mesh(self):
+        if self._dirty:
+            self._rebuild()
+        return self._mesh
+
+    def get_prop_instances(self):
+        if self._dirty:
+            self._rebuild()
+        return self._prop_instances
+
+    def _rebuild(self):
+        self._samples = self._compute_samples()
+        self._mesh = self._compute_mesh(self._samples)
+        self._prop_instances = self._compute_prop_instances(self._samples)
+        self._dirty = False
+
+    def _is_closed(self):
+        return self.closed and len(self.points) >= 3
+
+    def _compute_samples(self):
+        pts = self.points
+        n = len(pts)
+        if n < 2:
+            return []
+        closed = self._is_closed()
+        seg_count = n if closed else n - 1
+        samples = []
+        cum = 0.0
+        prev_pos = None
+        for seg in range(seg_count):
+            if closed:
+                p0 = pts[(seg - 1) % n]
+                p1 = pts[seg % n]
+                p2 = pts[(seg + 1) % n]
+                p3 = pts[(seg + 2) % n]
+            else:
+                p0 = pts[seg - 1] if seg - 1 >= 0 else pts[seg]
+                p1 = pts[seg]
+                p2 = pts[seg + 1]
+                p3 = pts[seg + 2] if seg + 2 < n else pts[seg + 1]
+            steps = self.STEPS_PER_SEGMENT
+            last_segment = (seg == seg_count - 1)
+            # on an open path, include the final endpoint once; on a closed
+            # loop the final segment's endpoint is identical to sample[0],
+            # so it's skipped to avoid a duplicate/degenerate closing tri
+            count = steps + 1 if (not closed and last_segment) else steps
+            for i in range(count):
+                t = i / steps
+                pos = catmull_rom_point(p0, p1, p2, p3, t)
+                if prev_pos is not None:
+                    cum += float(np.linalg.norm(pos - prev_pos))
+                samples.append({"pos": pos, "dist": cum})
+                prev_pos = pos
+
+        m = len(samples)
+        for i in range(m):
+            if closed:
+                prev_i = (i - 1) % m
+                next_i = (i + 1) % m
+                tangent = samples[next_i]["pos"] - samples[prev_i]["pos"]
+            elif i == 0:
+                tangent = samples[1]["pos"] - samples[0]["pos"]
+            elif i == m - 1:
+                tangent = samples[i]["pos"] - samples[i - 1]["pos"]
+            else:
+                tangent = samples[i + 1]["pos"] - samples[i - 1]["pos"]
+            tl = np.linalg.norm(tangent)
+            tangent = tangent / tl if tl > 1e-8 else np.array([1.0, 0.0, 0.0])
+            right = np.cross(tangent, np.array([0.0, 1.0, 0.0]))
+            rl = np.linalg.norm(right)
+            right = right / rl if rl > 1e-8 else np.array([0.0, 0.0, 1.0])
+            samples[i]["tangent"] = tangent
+            samples[i]["right"] = right
+        return samples
+
+    def _compute_mesh(self, samples):
+        n = len(samples)
+        if n < 2:
+            return None
+        closed = self._is_closed()
+        verts = np.zeros((n * 2, 3), dtype="float32")
+        normals = np.zeros((n * 2, 3), dtype="float32")
+        uvs = np.zeros((n * 2, 2), dtype="float32")
+        for i, s in enumerate(samples):
+            left = (s["pos"] - s["right"] * self.half_width).copy()
+            right = (s["pos"] + s["right"] * self.half_width).copy()
+            left[1] += self.height_offset
+            right[1] += self.height_offset
+            verts[i * 2] = left
+            verts[i * 2 + 1] = right
+            normals[i * 2] = (0.0, 1.0, 0.0)
+            normals[i * 2 + 1] = (0.0, 1.0, 0.0)
+            v = s["dist"] / max(self.uv_tile_length, 0.01)
+            uvs[i * 2] = (0.0, v)
+            uvs[i * 2 + 1] = (1.0, v)
+        tris = []
+        # for a closed loop, stitch one extra edge connecting the last
+        # ring of verts back to the first, completing the circuit
+        edge_count = n if closed else n - 1
+        for i in range(edge_count):
+            i0, i1 = i * 2, i * 2 + 1
+            ni = (i + 1) % n
+            i2, i3 = ni * 2, ni * 2 + 1
+            tris.append((i0, i2, i1))
+            tris.append((i1, i2, i3))
+        return verts, normals, uvs, np.array(tris, dtype="uint32")
+
+    def _compute_prop_instances(self, samples):
+        if len(samples) < 2 or not self.prop_layers:
+            return []
+        instances = []
+        for layer in self.prop_layers:
+            if not layer.get("enabled", True):
+                continue
+            spacing = max(float(layer.get("spacing", 3.0)), 0.1)
+            side = layer.get("side", "both")
+            offset = float(layer.get("offset", 0.3))
+            yaw_offset = math.radians(float(layer.get("yaw_offset", 0.0)))
+            prop_type = layer.get("type", "fence")
+            off = self.half_width + offset
+            last_dist = -1e9
+            for s in samples:
+                if s["dist"] - last_dist < spacing:
+                    continue
+                last_dist = s["dist"]
+                # Yaw is derived fresh from THIS sample's tangent, so every
+                # instance's rotation tracks the curve's local direction -
+                # a fence on a bend rotates smoothly along with it instead
+                # of holding one fixed orientation for the whole road.
+                #
+                # The negation matters: glRotatef(angle, 0,1,0) sends the
+                # model's local +X axis to world (cos(angle), 0, -sin(angle)),
+                # which is the mirror of math.atan2's own sign convention
+                # (+X toward +Z). Without the negation every prop's
+                # authored "forward" pointed the wrong way relative to the
+                # tangent, and the mismatch grew the more the road curved -
+                # exactly the "props don't align with the road" symptom.
+                yaw = -math.atan2(s["tangent"][2], s["tangent"][0]) + yaw_offset
+                if side in ("left", "both"):
+                    instances.append((s["pos"] - s["right"] * off, yaw, "left", prop_type))
+                if side in ("right", "both"):
+                    instances.append((s["pos"] + s["right"] * off, yaw, "right", prop_type))
+        return instances
+
+    # -- terrain deformation ------------------------------------------------
+
+    def apply_to_terrain(self, terrain):
+        """Flattens the terrain under the road (full snap within half_width,
+        cosine falloff blend for `affect_width` beyond that), matching the
+        feel of the sculpt brush's falloff so the carve reads naturally."""
+        samples = self.get_samples()
+        if len(samples) < 2:
+            return
+        positions = np.array([s["pos"] for s in samples], dtype="float64")
+        if self._is_closed() and len(positions) >= 2:
+            # add the wrap-around segment back to the start point so the
+            # carve doesn't leave a gap at the loop's seam
+            positions = np.vstack([positions, positions[0:1]])
+        A = positions[:-1]
+        B = positions[1:]
+        seg_len2 = (B[:, 0] - A[:, 0]) ** 2 + (B[:, 2] - A[:, 2]) ** 2
+        seg_len2[seg_len2 < 1e-9] = 1e-9
+
+        vx = terrain.vertices[:, 0].astype("float64")
+        vz = terrain.vertices[:, 2].astype("float64")
+        n = len(vx)
+        min_dist = np.full(n, np.inf)
+        target_h = np.zeros(n)
+
+        for i in range(len(A)):
+            ax, az, ay = A[i, 0], A[i, 2], A[i, 1]
+            bx, bz, by = B[i, 0], B[i, 2], B[i, 1]
+            t = ((vx - ax) * (bx - ax) + (vz - az) * (bz - az)) / seg_len2[i]
+            t = np.clip(t, 0.0, 1.0)
+            cx = ax + t * (bx - ax)
+            cz = az + t * (bz - az)
+            ch = ay + t * (by - ay)
+            d = np.sqrt((vx - cx) ** 2 + (vz - cz) ** 2)
+            better = d < min_dist
+            min_dist[better] = d[better]
+            target_h[better] = ch[better]
+
+        total_radius = self.half_width + self.affect_width
+        affected = min_dist <= total_radius
+        if not np.any(affected):
+            return
+        d = min_dist[affected]
+        inside = d <= self.half_width
+        edge_t = np.zeros_like(d)
+        if self.affect_width > 1e-6:
+            edge_t = np.clip((d - self.half_width) / self.affect_width, 0.0, 1.0)
+        falloff = 0.5 * (1.0 + np.cos(np.pi * edge_t))
+        blend = np.where(inside, 1.0, falloff)
+
+        cur = terrain.vertices[affected, 1]
+        th = target_h[affected]
+        terrain.vertices[affected, 1] = cur + (th - cur) * blend
+        terrain.recompute_derived()
+
+
+# -- modular road props (fence, lamp - easy to extend, plus anything the --
+# -- user imports via "Import custom road prop") ---------------------------
+
+ROAD_PROP_TYPE_KEYS = ["fence", "lamp"]
+ROAD_PROP_TYPE_LABELS = ["Fence", "Lamp"]
+
+
+def _build_fence_prop_list():
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    post_h, post_r = 0.7, 0.045
+    segs = 6
+    glColor3f(0.42, 0.30, 0.16)
+    glBegin(GL_TRIANGLES)
+    for i in range(segs):
+        a0 = 2 * math.pi * i / segs
+        a1 = 2 * math.pi * (i + 1) / segs
+        x0, z0 = math.cos(a0) * post_r, math.sin(a0) * post_r
+        x1, z1 = math.cos(a1) * post_r, math.sin(a1) * post_r
+        glNormal3f(math.cos(a0), 0.0, math.sin(a0))
+        glVertex3f(x0, 0.0, z0)
+        glVertex3f(x0, post_h, z0)
+        glNormal3f(math.cos(a1), 0.0, math.sin(a1))
+        glVertex3f(x1, 0.0, z1)
+        glVertex3f(x1, 0.0, z1)
+        glVertex3f(x0, post_h, z0)
+        glVertex3f(x1, post_h, z1)
+    glEnd()
+    # two horizontal rail stubs (running along local +X, i.e. this prop's
+    # "forward" axis) so repeated posts read as a fence line that runs
+    # parallel to the road rather than sticking out perpendicular to it
+    rail_len, rail_thick = 0.9, 0.04
+    glColor3f(0.46, 0.34, 0.18)
+    for rail_y in (0.30, 0.55):
+        glBegin(GL_TRIANGLES)
+        glNormal3f(0.0, 1.0, 0.0)
+        glVertex3f(-rail_len * 0.5, rail_y, -rail_thick)
+        glVertex3f(rail_len * 0.5, rail_y, -rail_thick)
+        glVertex3f(rail_len * 0.5, rail_y, rail_thick)
+        glVertex3f(-rail_len * 0.5, rail_y, -rail_thick)
+        glVertex3f(rail_len * 0.5, rail_y, rail_thick)
+        glVertex3f(-rail_len * 0.5, rail_y, rail_thick)
+        glEnd()
+    glEndList()
+    return list_id
+
+
+def _build_lamp_prop_list():
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    pole_h, pole_r = 2.2, 0.05
+    segs = 6
+    glColor3f(0.20, 0.20, 0.22)
+    glBegin(GL_TRIANGLES)
+    for i in range(segs):
+        a0 = 2 * math.pi * i / segs
+        a1 = 2 * math.pi * (i + 1) / segs
+        x0, z0 = math.cos(a0) * pole_r, math.sin(a0) * pole_r
+        x1, z1 = math.cos(a1) * pole_r, math.sin(a1) * pole_r
+        glNormal3f(math.cos(a0), 0.0, math.sin(a0))
+        glVertex3f(x0, 0.0, z0)
+        glVertex3f(x0, pole_h, z0)
+        glNormal3f(math.cos(a1), 0.0, math.sin(a1))
+        glVertex3f(x1, 0.0, z1)
+        glVertex3f(x1, 0.0, z1)
+        glVertex3f(x0, pole_h, z0)
+        glVertex3f(x1, pole_h, z1)
+    glEnd()
+    glColor3f(0.95, 0.85, 0.45)
+    r = 0.16
+    glBegin(GL_TRIANGLES)
+    for p0, p1, p2 in _sphere_triangles(4, 6):
+        for p in (p0, p1, p2):
+            nx, ny, nz = p[0], p[1] - 1.0, p[2]
+            glNormal3f(nx, ny, nz)
+            glVertex3f(p[0] * r, pole_h + (p[1] - 1.0) * r, p[2] * r)
+    glEnd()
+    glEndList()
+    return list_id
+
+
+ROAD_PROP_LIST_BUILDERS = {"fence": _build_fence_prop_list, "lamp": _build_lamp_prop_list}
+
+
+def build_road_prop_display_lists():
+    """Must be called after the OpenGL context exists."""
+    return {name: builder() for name, builder in ROAD_PROP_LIST_BUILDERS.items()}
+
+
+def build_road_texture_presets():
+    """A handful of ready-made road-surface looks, built the same
+    procedural way as the terrain layer textures, so there's no external
+    asset dependency for the common cases. Custom-imported images (see
+    load_texture_from_file) get added into this same dict under their own
+    name, so they show up identically in the road's "Texture" dropdown -
+    each road picks one by name via RoadSpline.texture_key.
+    Must be called after the OpenGL context exists."""
+    return {
+        "Asphalt": create_gl_texture(generate_texture((0.22, 0.22, 0.24), seed=7, speckle=True)),
+        "Dirt Road": create_gl_texture(generate_texture((0.40, 0.30, 0.17), seed=11, speckle=True)),
+        "Cobblestone": create_gl_texture(generate_texture((0.45, 0.44, 0.42), seed=12, streaks=True)),
+        "Brick": create_gl_texture(generate_texture((0.55, 0.24, 0.18), seed=13, streaks=True)),
+    }
+
+
+def draw_road_props(road, display_lists):
+    """Draws every prop instance for `road` (across all its enabled prop
+    layers). Each instance carries its own world position and a yaw
+    computed fresh from the spline's tangent at that point (see
+    RoadSpline._compute_prop_instances), so as the road curves, each post
+    along it is rotated to match the curve's local direction right there
+    - the whole fence/lamp line visibly follows the bend instead of every
+    instance sharing one rotation."""
+    glEnable(GL_LIGHTING)
+    for pos, yaw, _side, prop_type in road.get_prop_instances():
+        list_id = display_lists.get(prop_type)
+        if list_id is None:
+            continue
+        glPushMatrix()
+        glTranslatef(float(pos[0]), float(pos[1]), float(pos[2]))
+        glRotatef(math.degrees(yaw), 0.0, 1.0, 0.0)
+        glCallList(list_id)
+        glPopMatrix()
+
+
+def draw_road_mesh(road, texture_id):
+    mesh = road.get_mesh()
+    if mesh is None:
+        return
+    verts, normals, uvs, tris = mesh
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, texture_id)
+    glColor3f(1.0, 1.0, 1.0)
     glEnableClientState(GL_VERTEX_ARRAY)
     glEnableClientState(GL_NORMAL_ARRAY)
-    glEnableClientState(GL_COLOR_ARRAY)
-    glVertexPointer(3, GL_FLOAT, 0, terrain.vertices)
-    glNormalPointer(GL_FLOAT, 0, terrain.normals)
-    glColorPointer(3, GL_FLOAT, 0, terrain.colors)
-    glDrawElements(GL_TRIANGLES, len(terrain.tris) * 3, GL_UNSIGNED_INT, terrain.tris)
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, verts)
+    glNormalPointer(GL_FLOAT, 0, normals)
+    glTexCoordPointer(2, GL_FLOAT, 0, uvs)
+    glDrawElements(GL_TRIANGLES, len(tris) * 3, GL_UNSIGNED_INT, tris)
     glDisableClientState(GL_VERTEX_ARRAY)
     glDisableClientState(GL_NORMAL_ARRAY)
-    glDisableClientState(GL_COLOR_ARRAY)
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY)
+    glBindTexture(GL_TEXTURE_2D, 0)
+    glDisable(GL_TEXTURE_2D)
+    draw_road_centerline(road)
 
+
+def draw_road_centerline(road, color=(0.92, 0.85, 0.20)):
+    """A simple raised line marking down the middle of the road, for
+    visual read of the spline path. (A dashed lane-marking mesh would be
+    a nice follow-up, but a solid line keeps this fast and simple.)"""
+    samples = road.get_samples()
+    if len(samples) < 2:
+        return
+    glDisable(GL_LIGHTING)
+    glColor3f(*color)
+    glLineWidth(3.0)
+    glBegin(GL_LINE_STRIP)
+    for s in samples:
+        p = s["pos"]
+        glVertex3f(float(p[0]), float(p[1]) + road.height_offset + 0.02, float(p[2]))
+    if road._is_closed() and samples:
+        p0 = samples[0]["pos"]
+        glVertex3f(float(p0[0]), float(p0[1]) + road.height_offset + 0.02, float(p0[2]))
+    glEnd()
+    glLineWidth(1.0)
+    glEnable(GL_LIGHTING)
+
+
+def draw_road_control_points(road):
+    """Small ring + vertical tick gizmo at each control point, highlighted
+    red when selected, for the Road Editor tool."""
+    glDisable(GL_LIGHTING)
+    for i, p in enumerate(road.points):
+        selected = (i == road.selected_point)
+        if selected:
+            glColor3f(1.0, 0.3, 0.3)
+        else:
+            glColor3f(0.2, 0.8, 1.0)
+        radius = 0.35 if selected else 0.25
+        glBegin(GL_LINE_LOOP)
+        for j in range(16):
+            a = 2.0 * math.pi * j / 16
+            glVertex3f(p[0] + math.cos(a) * radius, p[1] + 0.05, p[2] + math.sin(a) * radius)
+        glEnd()
+        glBegin(GL_LINES)
+        glVertex3f(p[0], p[1] - 0.3, p[2])
+        glVertex3f(p[0], p[1] + 0.3, p[2])
+        glEnd()
+    glEnable(GL_LIGHTING)
+
+
+# ---------------------------------------------------------------------------
+# Rendering (client-side vertex arrays, no shaders needed for wireframe)
+# ---------------------------------------------------------------------------
 
 def draw_terrain_wireframe(terrain):
     glEnableClientState(GL_VERTEX_ARRAY)
@@ -887,7 +2121,7 @@ def draw_terrain_wireframe(terrain):
 def draw_brush_ring(center, radius, color=(1.0, 1.0, 0.2), segments=48):
     """A flat ring on the XZ plane at the brush's hit point, for feedback.
     Color is used to distinguish tools/modes (sculpt vs foliage paint vs
-    foliage erase)."""
+    foliage erase vs texture paint)."""
     glDisable(GL_LIGHTING)
     glColor3f(*color)
     glLineWidth(2.0)
@@ -923,8 +2157,9 @@ def main():
     glEnable(GL_COLOR_MATERIAL)
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
     glShadeModel(GL_SMOOTH)
-    # foliage instances are drawn with non-uniform world scale via glScalef;
-    # GL_NORMALIZE keeps their lighting normals correct regardless of scale.
+    # foliage/road-prop instances are drawn with non-uniform world scale
+    # via glScalef; GL_NORMALIZE keeps their lighting normals correct
+    # regardless of scale.
     glEnable(GL_NORMALIZE)
 
     glEnable(GL_POLYGON_OFFSET_FILL)
@@ -936,11 +2171,37 @@ def main():
     io.display_size = display
 
     terrain = Terrain(width=50, height=50, scale=5.0, seed=0)
+    terrain_resolution = terrain.width  # grid is always kept square (width == height)
 
     foliage_display_lists = build_foliage_display_lists()
     foliage = Foliage()  # starts empty - nothing is placed automatically
     rng_paint = np.random.default_rng()
     show_foliage = True
+
+    # -- realistic terrain texturing (splat-mapped, Unity style) -----------
+    terrain_textures = TerrainTextures(terrain, tile_scale=6.0)
+    terrain_tex_ids = build_terrain_textures()
+    default_terrain_tex_ids = dict(terrain_tex_ids)  # kept so a layer can be reset after a custom import
+    terrain_texture_import_status = ""
+    terrain_shader = build_shader_program(TERRAIN_VERT_SRC, TERRAIN_FRAG_SRC)
+    terrain_uniforms = {
+        name: glGetUniformLocation(terrain_shader, name)
+        for name in ("texGrass", "texDirt", "texRock", "texSand",
+                     "texScale", "lightDir", "camPos", "fogColor", "fogDensity")
+    }
+    terrain_uniforms["aWeights"] = glGetAttribLocation(terrain_shader, "aWeights")
+
+    light_dir = (0.35, 0.85, 0.35)
+    fog_color = (0.55, 0.62, 0.70)
+    fog_density = 0.012
+
+    # -- road / spline system ------------------------------------------------
+    road_prop_lists = build_road_prop_display_lists()
+    road_texture_presets = build_road_texture_presets()
+    road_texture_import_status = ""
+    roads = []            # list of RoadSpline
+    active_road_idx = 0
+    dragging_point = False
 
     cam_pos = np.array([0.0, 15.0, -45.0], dtype="float32")
     cam_yaw = 90.0
@@ -949,9 +2210,9 @@ def main():
     show_solid = True
     show_wireframe = False
 
-    # -- tool selection: sculpt terrain, or paint foliage ------------------
-    tool_idx = 0  # 0 = Sculpt Terrain, 1 = Paint Foliage
-    tool_labels = ["Sculpt Terrain", "Paint Foliage"]
+    # -- tool selection: sculpt terrain, paint foliage, paint texture, or edit roads --
+    tool_idx = 0
+    tool_labels = ["Sculpt Terrain", "Paint Foliage", "Paint Texture", "Road Editor"]
 
     brush_mode = 0  # 0=raise 1=lower 2=flatten 3=smooth
     brush_modes = ["Raise", "Lower", "Flatten", "Smooth"]
@@ -962,7 +2223,38 @@ def main():
     foliage_paint_rate = 6.0  # attempted placements per ~16ms frame at full rate
     foliage_erase_mode = False
     foliage_soft_edge = True  # denser near brush center, thinning toward the rim
+    foliage_force_place = False  # bypass height/slope rules - lets you paint on mountains/cliffs
     foliage_scatter_density = 1.0  # only used by the explicit "Scatter Fill" button
+
+    # -- custom foliage import (Sketchfab downloads / your own Blender exports) --
+    import_path = ""
+    import_name = "My Foliage"
+    import_min_h = -1.0
+    import_max_h = 2.0
+    import_min_up = 0.5
+    import_scale_range = (0.6, 1.2)
+    import_color = (0.35, 0.45, 0.22)
+    import_status = ""
+
+    # -- custom road-prop import (fence/lamp/etc - same .obj pipeline) --
+    road_import_path = ""
+    road_import_name = "My Prop"
+    road_import_height = 1.0
+    road_import_forward = "+X"
+    road_import_forward_options = ["+X", "+Z", "-X", "-Z"]
+    road_import_color = (0.5, 0.5, 0.52)
+    road_import_status = ""
+
+    # -- shared in-app file browser (Tkinter-free fallback); `browser_target`
+    # says which panel ("foliage", "road_prop", "road_texture", or
+    # "terrain_texture") the picked path goes to --
+    show_inapp_browser = False
+    browse_dir = default_browse_start_dir()
+    browser_target = None
+
+    texture_layer_idx = 0  # index into TerrainTextures.LAYER_NAMES
+    texture_strength = 0.6
+    texture_tile_scale = terrain_textures.tile_scale
 
     looking = False        # right mouse button held
     flatten_height = None  # captured at the start of a flatten stroke
@@ -971,6 +2263,7 @@ def main():
 
     while True:
         dt = clock.tick(60)
+        lmb_just_pressed = False
         for event in pygame.event.get():
             impl.process_event(event)
 
@@ -996,7 +2289,13 @@ def main():
                 if event.key == K_t:
                     show_foliage = not show_foliage
                 if event.key == K_TAB:
-                    tool_idx = 1 - tool_idx
+                    tool_idx = (tool_idx + 1) % len(tool_labels)
+                if event.key == K_DELETE and tool_idx == 3 and roads:
+                    road = roads[active_road_idx]
+                    if road.selected_point >= 0:
+                        road.remove_point(road.selected_point)
+                        road.apply_to_terrain(terrain)
+                        foliage.update_all(terrain)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 looking = True
                 pygame.mouse.set_visible(False)
@@ -1008,12 +2307,13 @@ def main():
                 pygame.event.set_grab(False)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 flatten_height = None  # reset flatten reference for a new stroke
+                lmb_just_pressed = True
 
         imgui.new_frame()
 
         # ---- ImGui panel ----
         imgui.set_next_window_position(15, 15, imgui.ONCE)
-        imgui.set_next_window_size(320, 0, imgui.ONCE)
+        imgui.set_next_window_size(400, 0, imgui.ONCE)
         imgui.begin("Terrain Editor", True)
 
         imgui.text("Mode: {}".format("Look/Fly (RMB held)" if looking else "Edit (LMB paints)"))
@@ -1028,7 +2328,7 @@ def main():
             clicked, brush_mode = imgui.combo("Brush", brush_mode, brush_modes)
             _, brush_radius = imgui.slider_float("Radius##sculpt", brush_radius, 1.0, 20.0)
             _, brush_strength = imgui.slider_float("Strength", brush_strength, 0.05, 5.0)
-        else:
+        elif tool_idx == 1:
             # -- foliage painting controls --
             imgui.text("Foliage Brush")
             _, foliage_type_idx = imgui.combo("Type", foliage_type_idx, FOLIAGE_TYPE_LABELS)
@@ -1036,8 +2336,339 @@ def main():
             _, foliage_paint_rate = imgui.slider_float("Density", foliage_paint_rate, 0.5, 30.0)
             _, foliage_soft_edge = imgui.checkbox("Soft edge falloff", foliage_soft_edge)
             _, foliage_erase_mode = imgui.checkbox("Erase mode", foliage_erase_mode)
+            _, foliage_force_place = imgui.checkbox(
+                "Force placement (ignore height/slope rules)", foliage_force_place
+            )
+            if foliage_force_place:
+                imgui.text_wrapped(
+                    "On: paints the selected type anywhere, even mountain "
+                    "peaks/cliffs its rule would normally reject. Pick a "
+                    "specific Type above (not 'All (mix)') for this to apply."
+                )
             if imgui.button("Clear all foliage"):
                 foliage.clear()
+
+            imgui.separator()
+            if imgui.tree_node("Import custom foliage (.obj)"):
+                imgui.text_wrapped(
+                    "Get a model from Sketchfab (pick the OBJ / Original "
+                    "Format download for CC-licensed models) or make your "
+                    "own in Blender and export via File > Export > "
+                    "Wavefront (.obj). Other formats (.fbx/.gltf/.glb)? "
+                    "Open them in Blender once and re-export as .obj."
+                )
+                imgui.text("File path:")
+                imgui.push_item_width(-1)
+                _, import_path = imgui.input_text("##foliage_import_path", import_path, 512)
+                imgui.pop_item_width()
+                if imgui.button("Browse...##foliage"):
+                    dialog_worked, picked = browse_for_model_file()
+                    if dialog_worked:
+                        if picked:
+                            import_path = picked
+                    else:
+                        browser_target = "foliage"
+                        show_inapp_browser = True
+                imgui.same_line()
+                if imgui.button("Browse (in-app)##foliage"):
+                    browser_target = "foliage"
+                    show_inapp_browser = True
+                _, import_name = imgui.input_text("Name", import_name, 64)
+                _, import_min_h = imgui.slider_float("Min height", import_min_h, -2.0, 2.0)
+                _, import_max_h = imgui.slider_float("Max height", import_max_h, -2.0, 2.0)
+                _, import_min_up = imgui.slider_float("Min flatness", import_min_up, 0.0, 1.0)
+                _, import_scale_range = imgui.slider_float2(
+                    "Scale range", import_scale_range[0], import_scale_range[1], 0.1, 3.0
+                )
+                _, import_color = imgui.color_edit3("Tint color", *import_color)
+                if imgui.button("Import as new foliage type"):
+                    if import_path and os.path.isfile(import_path):
+                        try:
+                            was_all = (foliage_type_idx >= len(FOLIAGE_RULES))
+                            new_idx = register_custom_foliage(
+                                foliage_display_lists,
+                                import_name or "Custom",
+                                import_path,
+                                min(import_min_h, import_max_h),
+                                max(import_min_h, import_max_h),
+                                import_min_up,
+                                (min(import_scale_range), max(import_scale_range)),
+                                color=import_color,
+                            )
+                            # keep "All (mix)" selected if it was selected before,
+                            # otherwise auto-select the freshly imported type
+                            foliage_type_idx = len(FOLIAGE_RULES) if was_all else new_idx
+                            import_status = "Imported '{}' as a new foliage type.".format(import_name)
+                        except Exception as e:
+                            import_status = "Import failed: {}".format(e)
+                    else:
+                        import_status = "That file path doesn't exist - check it or use Browse..."
+                if import_status:
+                    imgui.text_wrapped(import_status)
+                imgui.tree_pop()
+        elif tool_idx == 2:
+            # -- terrain texture (splat) painting controls --
+            imgui.text("Texture Brush")
+            _, texture_layer_idx = imgui.combo("Layer", texture_layer_idx, TerrainTextures.LAYER_NAMES)
+            _, brush_radius = imgui.slider_float("Radius##texture", brush_radius, 0.5, 20.0)
+            _, texture_strength = imgui.slider_float("Strength##texture", texture_strength, 0.02, 1.0)
+            changed_scale, texture_tile_scale = imgui.slider_float("Tile scale", texture_tile_scale, 1.0, 20.0)
+            if changed_scale:
+                terrain_textures.tile_scale = texture_tile_scale
+            if imgui.button("Reset from height/slope"):
+                terrain_textures.initialize_from_height_slope(terrain)
+
+            imgui.separator()
+            imgui.text("Layer image: {}".format(TerrainTextures.LAYER_NAMES[texture_layer_idx]))
+            imgui.text_wrapped(
+                "Swap the {} layer's tiled texture for your own image "
+                "instead of the procedural default.".format(TerrainTextures.LAYER_NAMES[texture_layer_idx])
+            )
+            if imgui.button("Browse...##terraintexture"):
+                dialog_worked, picked = browse_for_image_file()
+                if dialog_worked:
+                    if picked:
+                        try:
+                            tex_id = load_texture_from_file(picked)
+                            layer_key = TERRAIN_LAYER_KEYS[texture_layer_idx]
+                            terrain_tex_ids[layer_key] = tex_id
+                            terrain_texture_import_status = "Loaded custom texture for the {} layer.".format(
+                                TerrainTextures.LAYER_NAMES[texture_layer_idx])
+                        except Exception as e:
+                            terrain_texture_import_status = "Import failed: {}".format(e)
+                else:
+                    browser_target = "terrain_texture"
+                    show_inapp_browser = True
+            imgui.same_line()
+            if imgui.button("Browse (in-app)##terraintexture"):
+                browser_target = "terrain_texture"
+                show_inapp_browser = True
+            imgui.same_line()
+            if imgui.button("Reset layer"):
+                layer_key = TERRAIN_LAYER_KEYS[texture_layer_idx]
+                terrain_tex_ids[layer_key] = default_terrain_tex_ids[layer_key]
+                terrain_texture_import_status = "Reset the {} layer to its procedural default.".format(
+                    TerrainTextures.LAYER_NAMES[texture_layer_idx])
+            if terrain_texture_import_status:
+                imgui.text_wrapped(terrain_texture_import_status)
+        else:
+            # -- road / spline editor controls --
+            imgui.text("Road Editor")
+
+            if roads:
+                road_names = [r.name for r in roads]
+                _, active_road_idx = imgui.combo("Active Road", active_road_idx, road_names)
+                active_road_idx = max(0, min(active_road_idx, len(roads) - 1))
+                imgui.same_line()
+            if imgui.button("New Road"):
+                roads.append(RoadSpline("Road {}".format(len(roads) + 1)))
+                active_road_idx = len(roads) - 1
+
+            if roads:
+                if imgui.button("Delete Road"):
+                    roads.pop(active_road_idx)
+                    active_road_idx = max(0, active_road_idx - 1)
+
+            road = roads[active_road_idx] if roads else None
+
+            if road is not None:
+                if imgui.button("Delete Selected Point"):
+                    road.remove_point(road.selected_point)
+                    road.apply_to_terrain(terrain)
+                    foliage.update_all(terrain)
+                imgui.same_line()
+                if imgui.button("Clear Points"):
+                    road.clear()
+
+                # -- diverge / branch: start a brand new road at the
+                # currently-selected point of this road, for forks and
+                # junctions without hand-matching coordinates --
+                imgui.same_line()
+                branch_disabled = road.selected_point < 0
+                if branch_disabled:
+                    imgui.push_style_var(imgui.STYLE_ALPHA, 0.5)
+                if imgui.button("Branch New Road Here") and not branch_disabled:
+                    branch_pos = road.points[road.selected_point].copy()
+                    new_road = RoadSpline("Road {}".format(len(roads) + 1))
+                    new_road.add_point(branch_pos)
+                    new_road.half_width = road.half_width
+                    new_road.affect_width = road.affect_width
+                    new_road.texture_key = road.texture_key
+                    roads.append(new_road)
+                    active_road_idx = len(roads) - 1
+                    road = new_road
+                if branch_disabled:
+                    imgui.pop_style_var()
+                    imgui.text_disabled("(select a point on this road to branch from it)")
+
+                imgui.text_wrapped(
+                    "{} control point(s). Click empty ground to add a point, "
+                    "click + drag an existing point to move it, Delete key "
+                    "or the button above to remove the selected one.".format(len(road.points))
+                )
+
+                imgui.separator()
+                imgui.text("Road Shape")
+                changed_closed, new_closed = imgui.checkbox("Complete Track (closed loop)", road.closed)
+                if changed_closed:
+                    road.set_closed(new_closed)
+                    road.apply_to_terrain(terrain)
+                    foliage.update_all(terrain)
+                if road.closed and len(road.points) < 3:
+                    imgui.text_disabled("(needs at least 3 points to close into a loop)")
+
+                changed_w, road.half_width = imgui.slider_float("Width", road.half_width, 0.5, 10.0)
+                changed_a, road.affect_width = imgui.slider_float("Terrain blend margin", road.affect_width, 0.0, 10.0)
+                changed_h, road.height_offset = imgui.slider_float("Mesh height offset", road.height_offset, 0.0, 0.5)
+                changed_u, road.uv_tile_length = imgui.slider_float("Texture tile length", road.uv_tile_length, 0.5, 10.0)
+                if changed_w or changed_a or changed_h or changed_u:
+                    road.mark_dirty()
+
+                if imgui.button("Apply Road to Terrain"):
+                    road.apply_to_terrain(terrain)
+                    foliage.update_all(terrain)
+                imgui.text_wrapped(
+                    "Terrain carves automatically as you add/move/delete points. "
+                    "Press this after changing Width or Blend margin to re-carve."
+                )
+
+                imgui.separator()
+                imgui.text("Road Texture")
+                texture_names = list(road_texture_presets.keys())
+                cur_tex_idx = texture_names.index(road.texture_key) if road.texture_key in texture_names else 0
+                changed_tex, cur_tex_idx = imgui.combo("Texture", cur_tex_idx, texture_names)
+                if changed_tex:
+                    road.texture_key = texture_names[cur_tex_idx]
+                if imgui.button("Browse...##roadtexture"):
+                    dialog_worked, picked = browse_for_image_file()
+                    if dialog_worked:
+                        if picked:
+                            try:
+                                tex_id = load_texture_from_file(picked)
+                                name = os.path.splitext(os.path.basename(picked))[0]
+                                road_texture_presets[name] = tex_id
+                                road.texture_key = name
+                                road_texture_import_status = "Imported '{}' as a new road texture.".format(name)
+                            except Exception as e:
+                                road_texture_import_status = "Import failed: {}".format(e)
+                    else:
+                        browser_target = "road_texture"
+                        show_inapp_browser = True
+                imgui.same_line()
+                if imgui.button("Browse (in-app)##roadtexture"):
+                    browser_target = "road_texture"
+                    show_inapp_browser = True
+                if road_texture_import_status:
+                    imgui.text_wrapped(road_texture_import_status)
+
+                imgui.separator()
+                imgui.text("Modular Props ({} layer(s))".format(len(road.prop_layers)))
+                imgui.text_wrapped(
+                    "Stack as many layers as you like on one road - e.g. a "
+                    "fence layer plus a lamp layer - instead of making a "
+                    "new road per prop type. Each instance's rotation is "
+                    "computed from the road's curve right at that point, "
+                    "so it turns to follow every bend."
+                )
+                layer_to_remove = -1
+                for li, layer in enumerate(road.prop_layers):
+                    imgui.push_id("proplayer_{}".format(li))
+                    label = "{} - {}".format(li + 1, ROAD_PROP_TYPE_LABELS[
+                        ROAD_PROP_TYPE_KEYS.index(layer["type"])
+                    ] if layer["type"] in ROAD_PROP_TYPE_KEYS else layer["type"])
+                    if imgui.tree_node(label):
+                        changed_en, layer["enabled"] = imgui.checkbox("Enabled", layer["enabled"])
+                        type_idx = ROAD_PROP_TYPE_KEYS.index(layer["type"]) if layer["type"] in ROAD_PROP_TYPE_KEYS else 0
+                        changed_ty, type_idx = imgui.combo("Type", type_idx, ROAD_PROP_TYPE_LABELS)
+                        if changed_ty:
+                            layer["type"] = ROAD_PROP_TYPE_KEYS[type_idx]
+                        side_options = ["left", "right", "both"]
+                        side_idx = side_options.index(layer["side"])
+                        changed_side, side_idx = imgui.combo("Side", side_idx, ["Left", "Right", "Both"])
+                        if changed_side:
+                            layer["side"] = side_options[side_idx]
+                        changed_sp, layer["spacing"] = imgui.slider_float("Spacing", layer["spacing"], 0.5, 15.0)
+                        changed_of, layer["offset"] = imgui.slider_float("Offset from edge", layer["offset"], 0.0, 3.0)
+                        changed_yo, layer["yaw_offset"] = imgui.slider_float(
+                            "Rotation offset (deg)", layer["yaw_offset"], -180.0, 180.0
+                        )
+                        if changed_en or changed_ty or changed_side or changed_sp or changed_of or changed_yo:
+                            road.mark_dirty()
+                        if imgui.button("Remove layer"):
+                            layer_to_remove = li
+                        imgui.tree_pop()
+                    imgui.pop_id()
+                if layer_to_remove >= 0:
+                    road.remove_prop_layer(layer_to_remove)
+
+                if imgui.button("Add Prop Layer"):
+                    road.add_prop_layer()
+
+                imgui.separator()
+                if imgui.tree_node("Import custom road prop (.obj)"):
+                    imgui.text_wrapped(
+                        "Same pipeline as foliage import: a Sketchfab OBJ "
+                        "download or a Blender export (File > Export > "
+                        "Wavefront .obj). Once imported it shows up as a "
+                        "new option in every road's prop-layer Type dropdown, "
+                        "right next to Fence and Lamp."
+                    )
+                    imgui.text("File path:")
+                    imgui.push_item_width(-1)
+                    _, road_import_path = imgui.input_text("##road_import_path", road_import_path, 512)
+                    imgui.pop_item_width()
+                    if imgui.button("Browse...##roadprop"):
+                        dialog_worked, picked = browse_for_model_file()
+                        if dialog_worked:
+                            if picked:
+                                road_import_path = picked
+                        else:
+                            browser_target = "road_prop"
+                            show_inapp_browser = True
+                    imgui.same_line()
+                    if imgui.button("Browse (in-app)##roadprop"):
+                        browser_target = "road_prop"
+                        show_inapp_browser = True
+                    _, road_import_name = imgui.input_text("Name##roadprop", road_import_name, 64)
+                    _, road_import_height = imgui.slider_float("Model height", road_import_height, 0.1, 4.0)
+                    fwd_idx = road_import_forward_options.index(road_import_forward)
+                    changed_fwd, fwd_idx = imgui.combo(
+                        "Forward axis", fwd_idx, road_import_forward_options
+                    )
+                    if changed_fwd:
+                        road_import_forward = road_import_forward_options[fwd_idx]
+                    imgui.text_wrapped(
+                        "If the imported model looks rotated 90/180 degrees "
+                        "from the road direction once placed, change Forward "
+                        "axis (or nudge a layer's Rotation offset) rather "
+                        "than re-exporting the model."
+                    )
+                    _, road_import_color = imgui.color_edit3("Tint color##roadprop", *road_import_color)
+                    if imgui.button("Import as new road prop type"):
+                        if road_import_path and os.path.isfile(road_import_path):
+                            try:
+                                new_key = register_custom_road_prop(
+                                    road_prop_lists,
+                                    road_import_name or "Custom Prop",
+                                    road_import_path,
+                                    color=road_import_color,
+                                    target_height=road_import_height,
+                                    forward_axis=road_import_forward,
+                                )
+                                road_import_status = "Imported '{}' as a new road prop type.".format(road_import_name)
+                                # convenience: add a ready-to-use layer with the new type
+                                new_li = road.add_prop_layer(new_key)
+                                road.prop_layers[new_li]["type"] = new_key
+                                road.mark_dirty()
+                            except Exception as e:
+                                road_import_status = "Import failed: {}".format(e)
+                        else:
+                            road_import_status = "That file path doesn't exist - check it or use Browse..."
+                    if road_import_status:
+                        imgui.text_wrapped(road_import_status)
+                    imgui.tree_pop()
+            else:
+                imgui.text_wrapped("No road yet - click 'New Road' to start placing points.")
 
         imgui.separator()
         _, show_solid = imgui.checkbox("Show solid faces (G)", show_solid)
@@ -1048,11 +2679,36 @@ def main():
         imgui.separator()
         if imgui.button("Regenerate terrain"):
             terrain.regenerate(seed=int(np.random.randint(0, 1_000_000)))
+            terrain_textures.initialize_from_height_slope(terrain)  # fresh terrain -> fresh splat seed
+            for road in roads:
+                road.resnap_points_to_terrain(terrain)
+                road.apply_to_terrain(terrain)
             foliage.update_all(terrain)  # re-glue/cull existing foliage, add nothing new
         imgui.same_line()
         if imgui.button("Flatten to 0"):
             terrain.flatten_all(0.0)
+            for road in roads:
+                road.resnap_points_to_terrain(terrain)
+                road.apply_to_terrain(terrain)
             foliage.update_all(terrain)
+
+        if imgui.tree_node("Terrain Detail / Resolution"):
+            imgui.text_wrapped(
+                "Higher = smoother terrain and finer sculpting detail, but "
+                "slower to edit. Lower = coarser/blockier but faster. "
+                "Applying resamples the current shape onto the new grid, "
+                "then re-snaps roads and re-glues foliage - splat texture "
+                "painting is reset to its height/slope default."
+            )
+            _, terrain_resolution = imgui.slider_int("Grid resolution", terrain_resolution, 10, 150)
+            if imgui.button("Apply Resolution"):
+                terrain = terrain.resample_like(terrain_resolution, terrain_resolution)
+                terrain_textures = TerrainTextures(terrain, tile_scale=texture_tile_scale)
+                for road in roads:
+                    road.resnap_points_to_terrain(terrain)
+                    road.apply_to_terrain(terrain)
+                foliage.update_all(terrain)
+            imgui.tree_pop()
 
         if imgui.tree_node("Advanced: random scatter fill"):
             imgui.text_wrapped(
@@ -1065,12 +2721,59 @@ def main():
                                   seed=int(np.random.randint(0, 1_000_000)))
             imgui.tree_pop()
 
+        if imgui.tree_node("Atmosphere"):
+            _, fog_density = imgui.slider_float("Fog density", fog_density, 0.0, 0.05)
+            changed_fog, fog_color = imgui.color_edit3("Fog / sky color", *fog_color)
+            imgui.tree_pop()
+
         imgui.separator()
         imgui.text_wrapped(
             "RMB: look + WASD fly | Q/E or Shift/Space: down/up | "
-            "Tab: switch tool | LMB: paint with the active tool | T: toggle foliage"
+            "Tab: switch tool | LMB: paint/edit with the active tool | "
+            "T: toggle foliage | Delete: remove selected road point"
         )
         imgui.end()
+
+        if show_inapp_browser:
+            if browser_target == "road_prop":
+                title, browse_extensions = "Select Road Prop Model (.obj)", (".obj",)
+            elif browser_target == "road_texture":
+                title, browse_extensions = "Select Road Texture Image", (".png", ".jpg", ".jpeg", ".bmp")
+            elif browser_target == "terrain_texture":
+                title, browse_extensions = "Select Terrain Layer Texture Image", (".png", ".jpg", ".jpeg", ".bmp")
+            else:
+                title, browse_extensions = "Select Foliage Model (.obj)", (".obj",)
+            show_inapp_browser, browse_dir, picked_file = draw_inapp_browser(
+                browse_dir, title=title, extensions=browse_extensions
+            )
+            if picked_file:
+                if browser_target == "road_prop":
+                    road_import_path = picked_file
+                    road_import_status = "Selected: " + picked_file
+                elif browser_target == "road_texture":
+                    try:
+                        tex_id = load_texture_from_file(picked_file)
+                        name = os.path.splitext(os.path.basename(picked_file))[0]
+                        road_texture_presets[name] = tex_id
+                        if roads:
+                            roads[active_road_idx].texture_key = name
+                        road_texture_import_status = "Imported '{}' as a new road texture.".format(name)
+                    except Exception as e:
+                        road_texture_import_status = "Import failed: {}".format(e)
+                elif browser_target == "terrain_texture":
+                    try:
+                        tex_id = load_texture_from_file(picked_file)
+                        layer_key = TERRAIN_LAYER_KEYS[texture_layer_idx]
+                        terrain_tex_ids[layer_key] = tex_id
+                        terrain_texture_import_status = "Loaded custom texture for the {} layer.".format(
+                            TerrainTextures.LAYER_NAMES[texture_layer_idx])
+                    except Exception as e:
+                        terrain_texture_import_status = "Import failed: {}".format(e)
+                else:
+                    import_path = picked_file
+                    import_status = "Selected: " + picked_file
+                show_inapp_browser = False
+                browser_target = None
 
         # ---- camera look (only while RMB held) ----
         if looking:
@@ -1127,7 +2830,28 @@ def main():
             brush_hit = terrain.raycast(near.astype("float32"), ray_dir.astype("float32"))
 
             mouse_buttons = pygame.mouse.get_pressed()
-            if brush_hit is not None and mouse_buttons[0] and not looking:
+
+            if tool_idx == 3 and roads:
+                # -- road / spline editing --
+                road = roads[active_road_idx]
+                if mouse_buttons[0] and not looking:
+                    if not dragging_point:
+                        if lmb_just_pressed:
+                            idx = road.pick_point(near, ray_dir)
+                            if idx >= 0:
+                                road.selected_point = idx
+                                dragging_point = True
+                            elif brush_hit is not None:
+                                road.add_point(brush_hit)
+                                road.selected_point = len(road.points) - 1
+                    elif brush_hit is not None:
+                        road.move_point(road.selected_point, brush_hit)
+                else:
+                    if dragging_point:
+                        road.apply_to_terrain(terrain)
+                        foliage.update_all(terrain)
+                    dragging_point = False
+            elif brush_hit is not None and mouse_buttons[0] and not looking:
                 if tool_idx == 0:
                     # -- terrain sculpting --
                     mode_name = brush_modes[brush_mode].lower()
@@ -1139,7 +2863,7 @@ def main():
                     )
                     # keep foliage glued to (or removed from) the freshly edited area
                     foliage.update_region(terrain, brush_hit, brush_radius)
-                else:
+                elif tool_idx == 1:
                     # -- foliage painting --
                     if foliage_erase_mode:
                         foliage.erase_instances(brush_hit, brush_radius)
@@ -1150,10 +2874,16 @@ def main():
                         if rng_paint.random() < (rate - count):
                             count += 1
                         foliage.add_instances(terrain, brush_hit, brush_radius, count, selected, rng_paint,
-                                               soft_edge=foliage_soft_edge)
+                                               soft_edge=foliage_soft_edge, force=foliage_force_place)
+                else:
+                    # -- terrain texture (splat) painting --
+                    terrain_textures.paint(
+                        terrain, brush_hit, brush_radius,
+                        texture_strength * (dt / 16.0), texture_layer_idx,
+                    )
 
         # ---- render scene ----
-        glClearColor(0.1, 0.1, 0.15, 1.0)
+        glClearColor(fog_color[0], fog_color[1], fog_color[2], 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         glMatrixMode(GL_MODELVIEW)
@@ -1165,21 +2895,35 @@ def main():
         )
 
         if show_solid:
-            glEnable(GL_LIGHTING)
-            draw_terrain_solid(terrain)
+            draw_terrain_solid_textured(
+                terrain, terrain_tex_ids, terrain_textures.weights,
+                terrain_shader, terrain_uniforms,
+                cam_pos, terrain_textures.tile_scale, light_dir, fog_color, fog_density,
+            )
         if show_wireframe:
             glDisable(GL_LIGHTING)
             glColor3f(0.0, 0.0, 0.0)
             draw_terrain_wireframe(terrain)
+            glEnable(GL_LIGHTING)
         if show_foliage:
             draw_foliage(foliage, foliage_display_lists)
-        if brush_hit is not None:
+
+        for road in roads:
+            road_tex_id = road_texture_presets.get(road.texture_key) or next(iter(road_texture_presets.values()))
+            draw_road_mesh(road, road_tex_id)
+            if road.prop_layers:
+                draw_road_props(road, road_prop_lists)
+
+        if tool_idx == 3 and roads:
+            draw_road_control_points(roads[active_road_idx])
+
+        if brush_hit is not None and tool_idx != 3:
             if tool_idx == 0:
                 ring_color = (1.0, 1.0, 0.2)       # yellow: sculpt
-            elif foliage_erase_mode:
-                ring_color = (1.0, 0.25, 0.25)     # red: foliage erase
+            elif tool_idx == 1:
+                ring_color = (1.0, 0.25, 0.25) if foliage_erase_mode else (0.25, 1.0, 0.35)
             else:
-                ring_color = (0.25, 1.0, 0.35)     # green: foliage paint
+                ring_color = (0.3, 0.6, 1.0)       # blue: texture paint
             draw_brush_ring(brush_hit, brush_radius, ring_color)
             glEnable(GL_LIGHTING)
 
