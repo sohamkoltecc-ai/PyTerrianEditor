@@ -1,8 +1,8 @@
+<img width="100%" height="1000" alt="Gemini_Generated_Image_sudn85sudn85sudn" src="https://github.com/user-attachments/assets/3e5603f0-5442-4387-953f-e790a425adb6" />
+
 # 🌍 PSX -  Terrain Editor
 
 > A lightweight **3D Terrain Editor** built completely in **Python + OpenGL** for creating game environments, roads, forests, props, and exporting complete scenes directly to Blender.
-
-<img width="100%" height="1000" alt="Gemini_Generated_Image_sudn85sudn85sudn" src="https://github.com/user-attachments/assets/3e5603f0-5442-4387-953f-e790a425adb6" />
 
 ---
 
@@ -97,11 +97,13 @@
 
 ### Terrain Editor
 
-![Editor](docs/images/editor.png)
+<img width="1920" height="1080" alt="Screenshot 2026-07-12 155136" src="https://github.com/user-attachments/assets/6dbd8cdf-61b6-48e6-83c8-13e2304aa619" />
+
 
 ### Exported Scene in Blender
 
-![Blender](docs/images/blender.png)
+<img width="1920" height="1080" alt="Screenshot 2026-07-12 195126" src="https://github.com/user-attachments/assets/3d8bf211-fe02-41ce-891c-aab985920981" />
+
 
 ---
 
