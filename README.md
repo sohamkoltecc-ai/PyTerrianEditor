@@ -189,7 +189,7 @@ Visit the official website to learn more about the project, explore its features
 
 👉 **Download & Learn More**
 
-**🌍** :[contentReference[oaicite:0]{index=0}](https://psxterrianeditor.netlify.app/)
+**🌍** :https://psxterrianeditor.netlify.app/
 
 ---
 
